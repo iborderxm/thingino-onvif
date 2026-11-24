@@ -46,6 +46,27 @@
             "source_type": "tt:ReferenceToken",
             "source_value": "VideoSourceConfigToken",
             "input_file": "/run/motion/motion_alarm"
+        },
+        {
+            "topic": "tns1:RuleEngine/PersonDetector/Person",
+            "sources": [
+                {
+                    "name": "VideoSourceConfigurationToken",
+                    "type": "tt:ReferenceToken",
+                    "value": "VideoSourceConfigToken"
+                },
+                {
+                    "name": "VideoAnalyticsConfigurationToken",
+                    "type": "tt:ReferenceToken",
+                    "value": "VideoAnalyticsConfigToken"
+                },
+                {
+                    "name": "Rule",
+                    "type": "xsd:string",
+                    "value": "PersonDetector"
+                }
+            ],
+            "input_file": "/run/motion/person_alarm"
         }
     ],
     "imaging": [

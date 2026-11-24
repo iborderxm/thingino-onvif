@@ -390,6 +390,8 @@ int send_notify(char *reference, int alarm_index, time_t e_time, char *property,
         strcpy(data_name, "LogicalState");
     } else if (strstr(topic, "CellMotionDetector/Motion")) {
         strcpy(data_name, "IsMotion");
+    } else if (strstr(topic, "PersonDetector/Person")) {
+        strcpy(data_name, "IsPersonDetected");
     } else {
         strcpy(data_name, "State");
     }

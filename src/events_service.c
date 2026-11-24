@@ -518,6 +518,10 @@ int events_pull_messages()
                            && strstr(service_ctx.events[i].topic, "CellMotionDetector/Motion")) {
                     // ONVIF event catalog: CellMotionDetector/Motion carries IsMotion
                     strcpy(data_name, "IsMotion");
+                } else if (service_ctx.events[i].topic != NULL
+                           && strstr(service_ctx.events[i].topic, "PersonDetector/Person")) {
+                    // RuleEngine/PersonDetector/Person carries IsPersonDetected
+                    strcpy(data_name, "IsPersonDetected");
                 } else {
                     strcpy(data_name, "State");
                 }
@@ -974,18 +978,167 @@ int events_renew()
                iso_str_2);
 }
 
+/*
+ * Split a concrete ONVIF topic into up to 3 path components.
+ * Returns the number of components (0..3), or -1 when the topic has more
+ * than 3 levels (not supported by the TopicSet template).
+ */
+static int split_topic(const char *topic, char comps[][128])
+{
+    char buf[1024];
+    int levels = 0;
+    char *token;
+
+    if ((topic == NULL) || (topic[0] == '\0'))
+        return 0;
+
+    snprintf(buf, sizeof(buf), "%s", topic);
+    token = strtok(buf, "/");
+    while ((token != NULL) && (levels < 3)) {
+        snprintf(comps[levels], 128, "%s", token);
+        levels++;
+        token = strtok(NULL, "/");
+    }
+
+    if (token != NULL)
+        return -1;
+
+    return levels;
+}
+
+/*
+ * Build the opening tag of one TopicSet level. Topic paths specify the
+ * namespace only on the first component (e.g. tns1:VideoSource/MotionAlarm),
+ * so every component without a prefix stays in the ONVIF topics namespace.
+ */
+static void topic_level_open(char *out, size_t outlen, const char *comp, int leaf)
+{
+    if (strchr(comp, ':') != NULL)
+        snprintf(out, outlen, "<%s%s>", comp, leaf ? "  wstop:topic=\"true\"" : "");
+    else
+        snprintf(out, outlen, "<tns1:%s%s>", comp, leaf ? "  wstop:topic=\"true\"" : "");
+}
+
+static void topic_level_close(char *out, size_t outlen, const char *comp)
+{
+    if (strchr(comp, ':') != NULL)
+        snprintf(out, outlen, "</%s>", comp);
+    else
+        snprintf(out, outlen, "</tns1:%s>", comp);
+}
+
+/* Data item carried by a known event topic (State/IsMotion/IsPersonDetected/...) */
+static void event_data_item(const char *topic, char *data_name, char *data_type)
+{
+    if ((topic != NULL) && (strcmp(topic, "tns1:Device/Trigger/Relay") == 0)) {
+        strcpy(data_name, "LogicalState");
+        strcpy(data_type, "tt:RelayLogicalState");
+    } else if ((topic != NULL) && (strstr(topic, "VideoSource/MotionAlarm") != NULL)) {
+        // ONVIF event catalog: VideoSource/MotionAlarm advertises State
+        strcpy(data_name, "State");
+        strcpy(data_type, "xsd:boolean");
+    } else if ((topic != NULL) && (strstr(topic, "CellMotionDetector/Motion") != NULL)) {
+        // ONVIF event catalog: CellMotionDetector/Motion advertises IsMotion
+        strcpy(data_name, "IsMotion");
+        strcpy(data_type, "xsd:boolean");
+    } else if ((topic != NULL) && (strstr(topic, "PersonDetector/Person") != NULL)) {
+        // RuleEngine/PersonDetector/Person advertises IsPersonDetected
+        strcpy(data_name, "IsPersonDetected");
+        strcpy(data_type, "xsd:boolean");
+    } else {
+        strcpy(data_name, "State");
+        strcpy(data_type, "xsd:boolean");
+    }
+}
+
+static long emit_event_topic_block(char *dest,
+                                   const char *l1s, const char *l2s, const char *l3s,
+                                   const char *sources_xml,
+                                   const char *data_name, const char *data_type,
+                                   const char *l3e, const char *l2e, const char *l1e)
+{
+    return cat(dest,
+               "events_service_files/GetEventProperties_2.xml",
+               18,
+               "%TOPIC_L1_START%", l1s,
+               "%TOPIC_L2_START%", l2s,
+               "%TOPIC_L3_START%", l3s,
+               "%SOURCES%", sources_xml,
+               "%DATA_NAME%", data_name,
+               "%DATA_TYPE%", data_type,
+               "%TOPIC_L3_END%", l3e,
+               "%TOPIC_L2_END%", l2e,
+               "%TOPIC_L1_END%", l1e);
+}
+
 int events_get_event_properties()
 {
-    int c, i, j, ret;
-    char topic[1024];
-    char topic_ls[3][256];
-    char topic_le[3][256];
-    char *token;
+    int c, i, j, k;
+    int event_count;
+    int depth[MAX_EVENTS];
+    unsigned char valid[MAX_EVENTS];
+    unsigned char skip[MAX_EVENTS];
+    unsigned char emitted[MAX_EVENTS];
+    char comps[MAX_EVENTS][3][128];
+    char l1s[256], l1e[256];
+    char l2s[256], l2e[256];
+    char l3s[256], l3e[256];
+    char sources_xml[512];
+    char data_name[32];
+    char data_type[32];
     long size, total_size;
     char dest_a[] = "stdout";
     char *dest;
-    char data_name[32];
-    char data_type[32];
+
+    /*
+     * Parse all configured topics once: the TopicSet has to be emitted as a
+     * real tree, so events sharing a topic path must be grouped together
+     * instead of repeating the whole L1/L2 branch for each event.
+     */
+    event_count = service_ctx.events_num;
+    if (event_count > MAX_EVENTS)
+        event_count = MAX_EVENTS;
+
+    memset(valid, 0, sizeof(valid));
+    memset(skip, 0, sizeof(skip));
+    // Components are compared as fixed-size blocks below, so clear them
+    // to avoid comparing uninitialized tail bytes.
+    memset(comps, 0, sizeof(comps));
+
+    for (i = 0; i < event_count; i++) {
+        if (service_ctx.events[i].topic == NULL) {
+            log_warn("Skipping event %d with NULL topic in GetEventProperties", i);
+            continue;
+        }
+        depth[i] = split_topic(service_ctx.events[i].topic, comps[i]);
+        if (depth[i] < 0) {
+            log_error("The topic has too many levels");
+            send_action_failed_fault("events_service", -1);
+            return -1;
+        }
+        if (depth[i] == 0) {
+            log_warn("Skipping event %d with empty topic in GetEventProperties", i);
+            continue;
+        }
+        valid[i] = 1;
+    }
+
+    /*
+     * Collapse duplicate topic paths (e.g. two relays both advertising
+     * tns1:Device/Trigger/Relay) so each topic is advertised only once.
+     */
+    for (i = 0; i < event_count; i++) {
+        if (!valid[i])
+            continue;
+        for (j = 0; j < i; j++) {
+            if (!valid[j] || (depth[j] != depth[i]))
+                continue;
+            if (memcmp(comps[j], comps[i], depth[i] * 128) == 0) {
+                skip[i] = 1;
+                break;
+            }
+        }
+    }
 
     // We need 1st step to evaluate content length
     for (c = 0; c < 2; c++) {
@@ -1001,137 +1154,113 @@ int events_get_event_properties()
             total_size = size;
 
         int included_any_topic = 0;
-        for (i = 0; i < service_ctx.events_num; i++) {
-            // Skip events with NULL topic to prevent segfaults
-            if (service_ctx.events[i].topic == NULL) {
-                log_warn("Skipping event %d with NULL topic in GetEventProperties", i);
+        memset(emitted, 0, sizeof(emitted));
+
+        for (i = 0; i < event_count; i++) {
+            if (!valid[i] || skip[i] || emitted[i])
+                continue;
+
+            // A single-level topic is a leaf and cannot be merged with siblings
+            if (depth[i] == 1) {
+                topic_level_open(l1s, sizeof(l1s), comps[i][0], 1);
+                topic_level_close(l1e, sizeof(l1e), comps[i][0]);
+                event_data_item(service_ctx.events[i].topic, data_name, data_type);
+                build_event_source_descriptions(sources_xml, sizeof(sources_xml),
+                                                &service_ctx.events[i]);
+                size = emit_event_topic_block(dest, l1s, "", "", sources_xml,
+                                              data_name, data_type, "", "", l1e);
+                if (c == 0)
+                    total_size += size;
+                emitted[i] = 1;
+                included_any_topic = 1;
                 continue;
             }
-            topic_ls[0][0] = '\0';
-            topic_ls[1][0] = '\0';
-            topic_ls[2][0] = '\0';
-            topic_le[0][0] = '\0';
-            topic_le[1][0] = '\0';
-            topic_le[2][0] = '\0';
-            // Ensure we have a valid topic string to prevent null pointer dereference
-            const char *safe_topic = service_ctx.events[i].topic ? service_ctx.events[i].topic : "Unknown/Unknown/Unknown";
-            strcpy(topic, safe_topic);
-            token = strtok(topic, "/");
 
-            /* walk through other tokens */
-            for (j = 0; j < 3; j++) {
-                /*
-                 * Topic paths specify the namespace only on the first
-                 * component (e.g. tns1:VideoSource/MotionAlarm). Keep every
-                 * generated element in the ONVIF topics namespace so the
-                 * TopicSet tree matches the advertised ConcreteSet paths.
-                 */
-                if (strchr(token, ':') != NULL) {
-                    snprintf(topic_ls[j], sizeof(topic_ls[j]), "<%s", token);
-                    snprintf(topic_le[j], sizeof(topic_le[j]), "</%s>", token);
+            // Index of the last event sharing this L1 element: it closes L1
+            int last_l1 = i;
+            for (k = i; k < event_count; k++) {
+                if (!valid[k] || skip[k] || (depth[k] < 2))
+                    continue;
+                if (strcmp(comps[k][0], comps[i][0]) == 0)
+                    last_l1 = k;
+            }
+
+            for (j = i; j < event_count; j++) {
+                if (!valid[j] || skip[j] || emitted[j] || (depth[j] < 2))
+                    continue;
+                if (strcmp(comps[j][0], comps[i][0]) != 0)
+                    continue;
+
+                l1s[0] = l1e[0] = l2s[0] = l2e[0] = l3s[0] = l3e[0] = '\0';
+
+                if (j == i)
+                    topic_level_open(l1s, sizeof(l1s), comps[j][0], 0);
+                if (j == last_l1)
+                    topic_level_close(l1e, sizeof(l1e), comps[j][0]);
+
+                if (depth[j] == 2) {
+                    // Two-level topic: L2 is the leaf (e.g. VideoSource/MotionAlarm)
+                    topic_level_open(l2s, sizeof(l2s), comps[j][1], 1);
+                    topic_level_close(l2e, sizeof(l2e), comps[j][1]);
                 } else {
-                    snprintf(topic_ls[j], sizeof(topic_ls[j]), "<tns1:%s", token);
-                    snprintf(topic_le[j], sizeof(topic_le[j]), "</tns1:%s>", token);
+                    int first_l2 = 1;
+                    int last_l2 = 1;
+
+                    for (k = i; k < j; k++) {
+                        if (!valid[k] || skip[k] || (depth[k] != 3))
+                            continue;
+                        if ((strcmp(comps[k][0], comps[j][0]) == 0)
+                            && (strcmp(comps[k][1], comps[j][1]) == 0)) {
+                            first_l2 = 0;
+                            break;
+                        }
+                    }
+                    for (k = j + 1; k < event_count; k++) {
+                        if (!valid[k] || skip[k] || (depth[k] != 3))
+                            continue;
+                        if ((strcmp(comps[k][0], comps[j][0]) == 0)
+                            && (strcmp(comps[k][1], comps[j][1]) == 0)) {
+                            last_l2 = 0;
+                            break;
+                        }
+                    }
+
+                    if (first_l2)
+                        topic_level_open(l2s, sizeof(l2s), comps[j][1], 0);
+                    if (last_l2)
+                        topic_level_close(l2e, sizeof(l2e), comps[j][1]);
+
+                    topic_level_open(l3s, sizeof(l3s), comps[j][2], 1);
+                    topic_level_close(l3e, sizeof(l3e), comps[j][2]);
                 }
 
-                token = strtok(NULL, "/");
-                if (token == NULL) {
-                    strcat(topic_ls[j], "  wstop:topic=\"true\">");
-                    break;
-                } else {
-                    strcat(topic_ls[j], ">");
-                }
-            }
-            if ((c == 0) && (j == 3) && (token != NULL)) {
-                log_error("The topic has too many levels");
-                send_action_failed_fault("events_service", -1);
-                return -1;
-            }
+                event_data_item(service_ctx.events[j].topic, data_name, data_type);
+                build_event_source_descriptions(sources_xml, sizeof(sources_xml),
+                                                &service_ctx.events[j]);
 
-            if (service_ctx.events[i].topic != NULL && strcmp("tns1:Device/Trigger/Relay", service_ctx.events[i].topic) == 0) {
-                strcpy(data_name, "LogicalState");
-                strcpy(data_type, "tt:RelayLogicalState");
-            } else if (service_ctx.events[i].topic != NULL
-                       && strstr(service_ctx.events[i].topic, "VideoSource/MotionAlarm")) {
-                // ONVIF event catalog: VideoSource/MotionAlarm advertises State
-                strcpy(data_name, "State");
-                strcpy(data_type, "xsd:boolean");
-            } else if (service_ctx.events[i].topic != NULL
-                       && strstr(service_ctx.events[i].topic, "CellMotionDetector/Motion")) {
-                // ONVIF event catalog: CellMotionDetector/Motion advertises IsMotion
-                strcpy(data_name, "IsMotion");
-                strcpy(data_type, "xsd:boolean");
-            } else {
-                strcpy(data_name, "State");
-                strcpy(data_type, "xsd:boolean");
+                size = emit_event_topic_block(dest, l1s, l2s, l3s, sources_xml,
+                                              data_name, data_type, l3e, l2e, l1e);
+                if (c == 0)
+                    total_size += size;
+                emitted[j] = 1;
+                included_any_topic = 1;
             }
-
-            // Ensure we have valid strings to prevent null pointer dereference
-            char sources_xml[512];
-            build_event_source_descriptions(sources_xml, sizeof(sources_xml), &service_ctx.events[i]);
-
-            size = cat(dest,
-                       "events_service_files/GetEventProperties_2.xml",
-                       18,
-                       "%TOPIC_L1_START%",
-                       topic_ls[0],
-                       "%TOPIC_L2_START%",
-                       topic_ls[1],
-                       "%TOPIC_L3_START%",
-                       topic_ls[2],
-                       "%SOURCES%",
-                       sources_xml,
-                       "%DATA_NAME%",
-                       data_name,
-                       "%DATA_TYPE%",
-                       data_type,
-                       "%TOPIC_L3_END%",
-                       topic_le[2],
-                       "%TOPIC_L2_END%",
-                       topic_le[1],
-                       "%TOPIC_L1_END%",
-                       topic_le[0]);
-            if (c == 0)
-                total_size += size;
-            included_any_topic = 1;
         }
 
         // Fallback: if no topics are configured, still advertise Motion capability for compatibility (e.g., tinyCam)
         if (!included_any_topic) {
             // L1: tns1:VideoSource, L2: MotionAlarm, no L3
-            strcpy(topic_ls[0], "<tns1:VideoSource>");
-            strcpy(topic_le[0], "</tns1:VideoSource>");
-            strcpy(topic_ls[1], "<MotionAlarm  wstop:topic=\"true\">");
-            strcpy(topic_le[1], "</MotionAlarm>");
-            topic_ls[2][0] = '\0';
-            topic_le[2][0] = '\0';
+            topic_level_open(l1s, sizeof(l1s), "tns1:VideoSource", 0);
+            topic_level_close(l1e, sizeof(l1e), "tns1:VideoSource");
+            topic_level_open(l2s, sizeof(l2s), "MotionAlarm", 1);
+            topic_level_close(l2e, sizeof(l2e), "MotionAlarm");
             strcpy(data_name, "State");
             strcpy(data_type, "xsd:boolean");
             // Spec: MotionAlarm source is "Source" (the video source token)
-            char sources_xml[512];
             snprintf(sources_xml, sizeof(sources_xml),
                      "<tt:SimpleItemDescription Name=\"Source\" Type=\"tt:ReferenceToken\"/>");
-            size = cat(dest,
-                       "events_service_files/GetEventProperties_2.xml",
-                       18,
-                       "%TOPIC_L1_START%",
-                       topic_ls[0],
-                       "%TOPIC_L2_START%",
-                       topic_ls[1],
-                       "%TOPIC_L3_START%",
-                       "",
-                       "%SOURCES%",
-                       sources_xml,
-                       "%DATA_NAME%",
-                       data_name,
-                       "%DATA_TYPE%",
-                       data_type,
-                       "%TOPIC_L3_END%",
-                       "",
-                       "%TOPIC_L2_END%",
-                       topic_le[1],
-                       "%TOPIC_L1_END%",
-                       topic_le[0]);
+            size = emit_event_topic_block(dest, l1s, l2s, "", sources_xml,
+                                          data_name, data_type, "", l2e, l1e);
             if (c == 0)
                 total_size += size;
         }
