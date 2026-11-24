@@ -1,0 +1,249 @@
+# =============================================================================
+# Thingino ONVIF Project .gitignore
+# =============================================================================
+
+# =============================================================================
+# C/C++ Build Artifacts
+# =============================================================================
+
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Linker output
+*.ilk
+*.map
+*.exp
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# Kernel Module Compile Results
+*.mod*
+*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+Mkfile.old
+dkms.conf
+
+# Debug information files
+*.dwo
+
+# =============================================================================
+# Project-Specific Executables
+# =============================================================================
+
+# Main ONVIF server executables
+onvif_notify_server
+onvif_simple_server
+wsd_simple_server
+
+# Debug versions
+onvif_notify_server_debug
+onvif_simple_server_debug
+wsd_simple_server_debug
+
+# =============================================================================
+# Development and Testing
+# =============================================================================
+
+# Build directories
+bin/
+obj/
+build/
+dist/
+local/
+buildroot_package/
+onvif_logs/
+tests/
+xml/
+
+jct/
+mxml/
+libtomcrypt/
+
+
+# Test artifacts
+*.log
+*.tmp
+test_*
+!test_*.c
+!test_*.h
+!test_*.sh
+!test_*.xml
+!test_*.py
+!test_*.rb
+
+# Container temp files
+container/*_files/
+container/onvif.json
+container/onvif_notify_server
+container/onvif_simple_server
+container/wsd_simple_server
+
+# Temporary files
+tmp/
+temp/
+*.temp
+*.swp
+*.swo
+*~
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# =============================================================================
+# IDE and Editor Files
+# =============================================================================
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+
+# Vim
+*.swp
+*.swo
+*~
+.netrwhist
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# =============================================================================
+# System Files
+# =============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+*~
+
+# =============================================================================
+# Version Control and CI/CD
+# =============================================================================
+
+# Git
+*.orig
+*.rej
+
+# =============================================================================
+# Documentation and Packaging
+# =============================================================================
+
+# Generated documentation
+docs/html/
+docs/latex/
+*.pdf
+!docs/*.pdf
+
+# Package files
+*.tar.gz
+*.tgz
+*.zip
+*.deb
+*.rpm
+
+# =============================================================================
+# Configuration and Secrets
+# =============================================================================
+
+# Local configuration overrides
+config.local
+*.local
+.env
+.env.local
+
+# Secrets and credentials
+*.key
+*.pem
+*.crt
+secrets/
+credentials/
+
+# =============================================================================
+# Miscellaneous
+# =============================================================================
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Patch files
+*.patch
+*.diff
+
+# Coverage reports
+*.gcov
+*.gcda
+*.gcno
+coverage/
+
+# Profiling data
+gmon.out
+*.prof
+
+# Static analysis
+cppcheck-results.xml
+scan-build-*/
+logs/

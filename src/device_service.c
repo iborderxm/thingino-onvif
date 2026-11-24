@@ -1,0 +1,1439 @@
+/*
+ * Copyright (c) 2024 roleo.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "device_service.h"
+
+#include "fault.h"
+#include "log.h"
+#include "mxml_wrapper.h"
+#include "onvif_simple_server.h"
+#include "utils.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <glob.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/reboot.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+
+extern service_context_t service_ctx;
+
+int device_get_services()
+{
+    int ret = 0;
+    char address[16];
+    char netmask[16];
+
+    ret = get_ip_address(address, netmask, service_ctx.ifs);
+    if (ret < 0) {
+        log_error("Unable to get ip address from interface %s", service_ctx.ifs);
+        send_action_failed_fault("device_service", -1);
+        return -1;
+    }
+
+    char device_service_address[MAX_LEN];
+    char media_service_address[MAX_LEN];
+    char media2_service_address[MAX_LEN];
+    char ptz_service_address[MAX_LEN];
+    char events_service_address[MAX_LEN];
+    char deviceio_service_address[MAX_LEN];
+    char imaging_service_address[MAX_LEN];
+    char imaging_service_block[1024];
+    char port[8];
+    const char *cap;
+
+    char ebasesubscription[8], epullpoint[8];
+
+    char audio_sources[2], audio_outputs[2], relay_outputs[2];
+
+    port[0] = '\0';
+    if (service_ctx.port != 80)
+        sprintf(port, ":%d", service_ctx.port);
+    sprintf(device_service_address, "http://%s%s/onvif/device_service", address, port);
+    sprintf(media_service_address, "http://%s%s/onvif/media_service", address, port);
+    sprintf(media2_service_address, "http://%s%s/onvif/media2_service", address, port);
+    sprintf(ptz_service_address, "http://%s%s/onvif/ptz_service", address, port);
+    sprintf(events_service_address, "http://%s%s/onvif/events_service", address, port);
+    sprintf(deviceio_service_address, "http://%s%s/onvif/deviceio_service", address, port);
+
+    sprintf(imaging_service_address, "http://%s%s/onvif/imaging_service", address, port);
+
+    log_debug("[device_service] imaging_num at service advertisement: %d", service_ctx.imaging_num);
+    if (service_ctx.imaging_num > 0) {
+        snprintf(
+            imaging_service_block,
+            sizeof(imaging_service_block),
+            "<tds:Service><tds:Namespace>http://www.onvif.org/ver20/imaging/wsdl</tds:Namespace><tds:XAddr>%s</tds:XAddr><tds:Capabilities><timg:Capabilities xmlns:timg=\"http://www.onvif.org/ver20/imaging/wsdl\"><timg:ImageStabilization>false</timg:ImageStabilization><timg:ImagingPresets>false</timg:ImagingPresets><timg:AdaptablePreset>false</timg:AdaptablePreset></timg:Capabilities></tds:Capabilities><tds:Version><tt:Major>22</tt:Major><tt:Minor>6</tt:Minor></tds:Version></tds:Service>",
+            imaging_service_address);
+    } else {
+        imaging_service_block[0] = '\0';
+    }
+
+    if ((service_ctx.events_enable == EVENTS_PULLPOINT) || (service_ctx.events_enable == EVENTS_BOTH)) {
+        strcpy(epullpoint, "true");
+    } else {
+        strcpy(epullpoint, "false");
+    }
+
+    if ((service_ctx.events_enable == EVENTS_BASESUBSCRIPTION) || (service_ctx.events_enable == EVENTS_BOTH)) {
+        strcpy(ebasesubscription, "true");
+    } else {
+        strcpy(ebasesubscription, "false");
+    }
+
+    if ((service_ctx.profiles[0].audio_encoder != AUDIO_NONE)
+        || ((service_ctx.profiles_num == 2) && (service_ctx.profiles[1].audio_encoder != AUDIO_NONE))) {
+        sprintf(audio_sources, "%d", 1);
+    } else {
+        sprintf(audio_sources, "%d", 0);
+    }
+
+    if (service_ctx.audio.output_enabled) {
+        sprintf(audio_outputs, "%d", 1);
+    } else {
+        sprintf(audio_outputs, "%d", 0);
+    }
+
+    sprintf(relay_outputs, "%d", service_ctx.relay_outputs_num);
+    log_debug("DEBUG: device_get_services - relay_outputs_num: %d, relay_outputs string: %s", service_ctx.relay_outputs_num, relay_outputs);
+
+    cap = get_element("IncludeCapability", "Body");
+    if ((cap != NULL) && (strcasecmp(cap, "true")) == 0) {
+        if ((service_ctx.ptz_node.enable == 0) && (service_ctx.adv_enable_media2 == 0)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_with_capabilities_no_ptz_no_media2.xml",
+                            20,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%EVENTS_BASESUBSCRIPTION%",
+                            ebasesubscription,
+                            "%EVENTS_PULLPOINT%",
+                            epullpoint,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%AUDIO_SOURCES%",
+                            audio_sources,
+                            "%AUDIO_OUTPUTS%",
+                            audio_outputs,
+                            "%RELAY_OUTPUTS%",
+                            relay_outputs,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_with_capabilities_no_ptz_no_media2.xml",
+                       20,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%EVENTS_BASESUBSCRIPTION%",
+                       ebasesubscription,
+                       "%EVENTS_PULLPOINT%",
+                       epullpoint,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%AUDIO_SOURCES%",
+                       audio_sources,
+                       "%AUDIO_OUTPUTS%",
+                       audio_outputs,
+                       "%RELAY_OUTPUTS%",
+                       relay_outputs,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+
+        } else if ((service_ctx.ptz_node.enable == 0) && (service_ctx.adv_enable_media2 == 1)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_with_capabilities_no_ptz_media2.xml",
+                            22,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%MEDIA2_SERVICE_ADDRESS%",
+                            media2_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%EVENTS_BASESUBSCRIPTION%",
+                            ebasesubscription,
+                            "%EVENTS_PULLPOINT%",
+                            epullpoint,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%AUDIO_SOURCES%",
+                            audio_sources,
+                            "%AUDIO_OUTPUTS%",
+                            audio_outputs,
+                            "%RELAY_OUTPUTS%",
+                            relay_outputs,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_with_capabilities_no_ptz_media2.xml",
+                       22,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%MEDIA2_SERVICE_ADDRESS%",
+                       media2_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%EVENTS_BASESUBSCRIPTION%",
+                       ebasesubscription,
+                       "%EVENTS_PULLPOINT%",
+                       epullpoint,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%AUDIO_SOURCES%",
+                       audio_sources,
+                       "%AUDIO_OUTPUTS%",
+                       audio_outputs,
+                       "%RELAY_OUTPUTS%",
+                       relay_outputs,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+
+        } else if ((service_ctx.ptz_node.enable == 1) && (service_ctx.adv_enable_media2 == 0)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_with_capabilities_ptz_no_media2.xml",
+                            22,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%PTZ_SERVICE_ADDRESS%",
+                            ptz_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%EVENTS_BASESUBSCRIPTION%",
+                            ebasesubscription,
+                            "%EVENTS_PULLPOINT%",
+                            epullpoint,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%AUDIO_SOURCES%",
+                            audio_sources,
+                            "%AUDIO_OUTPUTS%",
+                            audio_outputs,
+                            "%RELAY_OUTPUTS%",
+                            relay_outputs,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_with_capabilities_ptz_no_media2.xml",
+                       22,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%PTZ_SERVICE_ADDRESS%",
+                       ptz_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%EVENTS_BASESUBSCRIPTION%",
+                       ebasesubscription,
+                       "%EVENTS_PULLPOINT%",
+                       epullpoint,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%AUDIO_SOURCES%",
+                       audio_sources,
+                       "%AUDIO_OUTPUTS%",
+                       audio_outputs,
+                       "%RELAY_OUTPUTS%",
+                       relay_outputs,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+
+        } else if ((service_ctx.ptz_node.enable == 1) && (service_ctx.adv_enable_media2 == 1)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_with_capabilities_ptz_media2.xml",
+                            24,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%MEDIA2_SERVICE_ADDRESS%",
+                            media2_service_address,
+                            "%PTZ_SERVICE_ADDRESS%",
+                            ptz_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%EVENTS_BASESUBSCRIPTION%",
+                            ebasesubscription,
+                            "%EVENTS_PULLPOINT%",
+                            epullpoint,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%AUDIO_SOURCES%",
+                            audio_sources,
+                            "%AUDIO_OUTPUTS%",
+                            audio_outputs,
+                            "%RELAY_OUTPUTS%",
+                            relay_outputs,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_with_capabilities_ptz_media2.xml",
+                       24,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%MEDIA2_SERVICE_ADDRESS%",
+                       media2_service_address,
+                       "%PTZ_SERVICE_ADDRESS%",
+                       ptz_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%EVENTS_BASESUBSCRIPTION%",
+                       ebasesubscription,
+                       "%EVENTS_PULLPOINT%",
+                       epullpoint,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%AUDIO_SOURCES%",
+                       audio_sources,
+                       "%AUDIO_OUTPUTS%",
+                       audio_outputs,
+                       "%RELAY_OUTPUTS%",
+                       relay_outputs,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+        }
+    } else {
+        if ((service_ctx.ptz_node.enable == 0) && (service_ctx.adv_enable_media2 == 0)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_no_ptz_no_media2.xml",
+                            10,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_no_ptz_no_media2.xml",
+                       10,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+
+        } else if ((service_ctx.ptz_node.enable == 0) && (service_ctx.adv_enable_media2 == 1)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_no_ptz_media2.xml",
+                            12,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%MEDIA2_SERVICE_ADDRESS%",
+                            media2_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_no_ptz_media2.xml",
+                       12,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%MEDIA2_SERVICE_ADDRESS%",
+                       media2_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+
+        } else if ((service_ctx.ptz_node.enable == 1) && (service_ctx.adv_enable_media2 == 0)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_ptz_no_media2.xml",
+                            12,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%PTZ_SERVICE_ADDRESS%",
+                            ptz_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_ptz_no_media2.xml",
+                       12,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%PTZ_SERVICE_ADDRESS%",
+                       ptz_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+
+        } else if ((service_ctx.ptz_node.enable == 1) && (service_ctx.adv_enable_media2 == 1)) {
+            long size = cat(NULL,
+                            "device_service_files/GetServices_ptz_media2.xml",
+                            14,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%MEDIA2_SERVICE_ADDRESS%",
+                            media2_service_address,
+                            "%PTZ_SERVICE_ADDRESS%",
+                            ptz_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%IMAGING_SERVICE_BLOCK%",
+                            imaging_service_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetServices_ptz_media2.xml",
+                       14,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%MEDIA2_SERVICE_ADDRESS%",
+                       media2_service_address,
+                       "%PTZ_SERVICE_ADDRESS%",
+                       ptz_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%IMAGING_SERVICE_BLOCK%",
+                       imaging_service_block);
+        }
+    }
+}
+
+int device_get_service_capabilities()
+{
+    long size = cat(NULL, "device_service_files/GetServiceCapabilities.xml", 0);
+
+    output_http_headers(size);
+
+    return cat("stdout", "device_service_files/GetServiceCapabilities.xml", 0);
+}
+
+int device_get_device_information()
+{
+    long size = cat(NULL,
+                    "device_service_files/GetDeviceInformation.xml",
+                    10,
+                    "%MANUFACTURER%",
+                    service_ctx.manufacturer,
+                    "%MODEL%",
+                    service_ctx.model,
+                    "%FIRMWARE_VERSION%",
+                    service_ctx.firmware_ver,
+                    "%SERIAL_NUMBER%",
+                    service_ctx.serial_num,
+                    "%HARDWARE_ID%",
+                    service_ctx.hardware_id);
+
+    output_http_headers(size);
+
+    return cat("stdout",
+               "device_service_files/GetDeviceInformation.xml",
+               10,
+               "%MANUFACTURER%",
+               service_ctx.manufacturer,
+               "%MODEL%",
+               service_ctx.model,
+               "%FIRMWARE_VERSION%",
+               service_ctx.firmware_ver,
+               "%SERIAL_NUMBER%",
+               service_ctx.serial_num,
+               "%HARDWARE_ID%",
+               service_ctx.hardware_id);
+}
+
+int device_get_system_date_and_time()
+{
+    char tz[64] = "GMT0";
+    FILE *fp;
+    size_t tzlen;
+
+    // Report the camera's real timezone instead of a hardcoded GMT0.
+    fp = fopen("/etc/TZ", "r");
+    if (fp) {
+        if (fgets(tz, sizeof(tz), fp)) {
+            tzlen = strlen(tz);
+            while (tzlen > 0 && (tz[tzlen - 1] == '\n' || tz[tzlen - 1] == '\r'))
+                tz[--tzlen] = '\0';
+        }
+        fclose(fp);
+    }
+
+    // Make localtime() honor the camera timezone even if the CGI process
+    // environment does not carry TZ (e.g. when invoked via httpd).
+    setenv("TZ", tz, 1);
+    tzset();
+
+    time_t timestamp = time(NULL);
+    /* localtime()/gmtime() share a static buffer; use the _r variants so the
+     * local result is not clobbered by the gmtime() call below. */
+    struct tm ltm, utm;
+    localtime_r(&timestamp, &ltm);
+    gmtime_r(&timestamp, &utm);
+
+    char isfalse[] = "false";
+    char istrue[] = "true";
+    char *dst = isfalse;
+    char hour[3];
+    char minute[3];
+    char second[3];
+    char year[5];
+    char month[3];
+    char day[3];
+    char lhour[3];
+    char lminute[3];
+    char lsecond[3];
+    char lyear[5];
+    char lmonth[3];
+    char lday[3];
+
+    // DST applies to local time; gmtime() never sets tm_isdst.
+    if (ltm.tm_isdst)
+        dst = istrue;
+
+    sprintf(hour, "%d", utm.tm_hour);
+    sprintf(minute, "%d", utm.tm_min);
+    sprintf(second, "%d", utm.tm_sec);
+    sprintf(year, "%d", utm.tm_year + 1900);
+    sprintf(month, "%d", utm.tm_mon + 1);
+    sprintf(day, "%d", utm.tm_mday);
+
+    sprintf(lhour, "%d", ltm.tm_hour);
+    sprintf(lminute, "%d", ltm.tm_min);
+    sprintf(lsecond, "%d", ltm.tm_sec);
+    sprintf(lyear, "%d", ltm.tm_year + 1900);
+    sprintf(lmonth, "%d", ltm.tm_mon + 1);
+    sprintf(lday, "%d", ltm.tm_mday);
+
+    long size = cat(NULL,
+                    "device_service_files/GetSystemDateAndTime.xml",
+                    28,
+                    "%DST%",
+                    dst,
+                    "%HOUR%",
+                    hour,
+                    "%MINUTE%",
+                    minute,
+                    "%SECOND%",
+                    second,
+                    "%YEAR%",
+                    year,
+                    "%MONTH%",
+                    month,
+                    "%DAY%",
+                    day,
+                    "%TZ%",
+                    tz,
+                    "%LOCAL_HOUR%",
+                    lhour,
+                    "%LOCAL_MINUTE%",
+                    lminute,
+                    "%LOCAL_SECOND%",
+                    lsecond,
+                    "%LOCAL_YEAR%",
+                    lyear,
+                    "%LOCAL_MONTH%",
+                    lmonth,
+                    "%LOCAL_DAY%",
+                    lday);
+
+    output_http_headers(size);
+
+    return cat("stdout",
+               "device_service_files/GetSystemDateAndTime.xml",
+               28,
+               "%DST%",
+               dst,
+               "%HOUR%",
+               hour,
+               "%MINUTE%",
+               minute,
+               "%SECOND%",
+               second,
+               "%YEAR%",
+               year,
+               "%MONTH%",
+               month,
+               "%DAY%",
+               day,
+               "%TZ%",
+               tz,
+               "%LOCAL_HOUR%",
+               lhour,
+               "%LOCAL_MINUTE%",
+               lminute,
+               "%LOCAL_SECOND%",
+               lsecond,
+               "%LOCAL_YEAR%",
+               lyear,
+               "%LOCAL_MONTH%",
+               lmonth,
+               "%LOCAL_DAY%",
+               lday);
+}
+
+/**
+ * Schedule the reboot in a child process detached from the CGI.
+ *
+ * The ONVIF server runs as a per-request CGI under uhttpd.  uhttpd
+ * SIGKILLs the CGI process as soon as the client closes the connection,
+ * so the reboot must not run on a thread of the CGI process (the thread
+ * dies with the process before reboot() is reached).  Instead, fork a
+ * child that is reparented to init and performs the reboot itself.
+ *
+ * Returns in the parent immediately so the CGI can exit cleanly;
+ * never returns in the child (the child _exit()s after rebooting).
+ */
+static void schedule_reboot(void)
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        /* fork() failed - fall back to an immediate reboot */
+        sync();
+        reboot(RB_AUTOBOOT);
+        return;
+    }
+
+    if (pid > 0)
+        return; /* parent: let the CGI process exit normally */
+
+    /* Child: detach from the CGI session and terminal. */
+    setsid();
+
+    /* Drop the inherited stdout pipe so uhttpd sees EOF on the CGI
+     * response once the parent exits, and ignore any further output. */
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > STDERR_FILENO)
+            close(devnull);
+    }
+
+    /* Give the client a moment to receive the response before reboot. */
+    sync();
+    sleep(1);
+    sync();
+    reboot(RB_AUTOBOOT);
+
+    /* reboot() returns only on failure. */
+    _exit(1);
+}
+
+int device_system_reboot()
+{
+    int ret;
+
+    long size = cat(NULL, "device_service_files/SystemReboot.xml", 0);
+
+    output_http_headers(size);
+
+    ret = cat("stdout", "device_service_files/SystemReboot.xml", 0);
+    fflush(stdout);
+
+    /* Schedule the reboot in a detached child (see schedule_reboot) and
+     * return at once: uhttpd kills the CGI process when the client
+     * closes the connection, which would otherwise take the reboot down
+     * with it before it runs. */
+    schedule_reboot();
+
+    return ret;
+}
+
+int device_get_scopes()
+{
+    int i;
+    size_t count = (size_t) service_ctx.scopes_num;
+    size_t alloc = count > 0 ? count * MAX_LEN : 1;
+    char *scopes = (char *) malloc(alloc);
+    char line[MAX_LEN];
+    int ret;
+
+    if (!scopes) {
+        log_error("device_get_scopes: out of memory");
+        send_action_failed_fault("device_service", -1);
+        return -1;
+    }
+
+    scopes[0] = '\0';
+    for (i = 0; i < service_ctx.scopes_num; i++) {
+        sprintf(line,
+                "\t    <tds:Scopes>\n\t\t<tt:ScopeDef>Fixed</tt:ScopeDef>\n\t\t<tt:ScopeItem>%s</tt:ScopeItem>\n\t    </tds:Scopes>\n",
+                service_ctx.scopes[i]);
+        strncat(scopes, line, alloc - strlen(scopes) - 1);
+    }
+
+    long size = cat(NULL, "device_service_files/GetScopes.xml", 2, "%SCOPES%", scopes);
+
+    output_http_headers(size);
+
+    ret = cat("stdout", "device_service_files/GetScopes.xml", 2, "%SCOPES%", scopes);
+    free(scopes);
+
+    return ret;
+}
+
+int device_get_users()
+{
+    // For security reason, returns empty message instead of service_ctx.user
+    send_empty_response("tds", "GetUsers");
+}
+
+int device_get_wsdl_url()
+{
+    long size = cat(NULL, "device_service_files/GetWsdlUrl.xml", 0);
+
+    output_http_headers(size);
+
+    return cat("stdout", "device_service_files/GetWsdlUrl.xml", 0);
+}
+
+int device_get_hostname()
+{
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname) - 1) != 0 || hostname[0] == '\0') {
+        strcpy(hostname, "Thingino");
+    }
+    hostname[sizeof(hostname) - 1] = '\0';
+
+    const char *from_dhcp = "true"; // Default to true per request; wiring real status later
+
+    long size = cat(NULL, "device_service_files/GetHostname.xml", 4, "%HOSTNAME%", hostname, "%FROM_DHCP%", from_dhcp);
+
+    output_http_headers(size);
+
+    return cat("stdout", "device_service_files/GetHostname.xml", 4, "%HOSTNAME%", hostname, "%FROM_DHCP%", from_dhcp);
+}
+int device_get_endpoint_reference()
+{
+    char identity[256];
+    char persistent_mac[32];
+    char guid[UUID_LEN + 1];
+
+    if (service_ctx.serial_num && service_ctx.serial_num[0]) {
+        snprintf(identity, sizeof(identity), "serial:%s", service_ctx.serial_num);
+        if (gen_uuid_v5(identity, guid) < 0)
+            gen_uuid(guid);
+    } else if (get_persistent_mac(persistent_mac, sizeof(persistent_mac)) == 0) {
+        snprintf(identity, sizeof(identity), "mac:%s", persistent_mac);
+        if (gen_uuid_v5(identity, guid) < 0)
+            gen_uuid(guid);
+    } else {
+        gen_uuid(guid);
+    }
+
+    long size = cat(NULL, "device_service_files/GetEndpointReference.xml", 2, "%GUID%", guid);
+
+    output_http_headers(size);
+
+    return cat("stdout", "device_service_files/GetEndpointReference.xml", 2, "%GUID%", guid);
+}
+
+int device_get_capabilities()
+{
+    int ret = 0;
+    char address[16];
+    char netmask[16];
+
+    ret = get_ip_address(address, netmask, service_ctx.ifs);
+    if (ret < 0) {
+        log_error("Unable to get ip address from interface %s", service_ctx.ifs);
+        send_action_failed_fault("device_service", -1);
+        return -1;
+    }
+
+    char device_service_address[MAX_LEN];
+    char media_service_address[MAX_LEN];
+    char ptz_service_address[MAX_LEN];
+    char events_service_address[MAX_LEN];
+    char deviceio_service_address[MAX_LEN];
+    char imaging_service_address[MAX_LEN];
+    char imaging_capabilities_block[256];
+    char port[8];
+    int icategory;
+    const char *category;
+
+    char ebasesubscription[8], epullpoint[8];
+
+    char audio_sources[2], audio_outputs[2], relay_outputs[2];
+
+    category = get_element("Category", "Body");
+    if (category != NULL) {
+        if (strcasecmp(category, "Device") == 0) {
+            icategory = 1;
+        } else if (strcasecmp(category, "Media") == 0) {
+            icategory = 2;
+        } else if (strcasecmp(category, "PTZ") == 0) {
+            icategory = 4;
+        } else if (strcasecmp(category, "Events") == 0) {
+            icategory = 8;
+        } else if (strcasecmp(category, "Imaging") == 0) {
+            icategory = 16;
+        } else if (strcasecmp(category, "All") == 0) {
+            icategory = 31;
+        } else {
+            send_fault("device_service",
+                       "Receiver",
+                       "ter:ActionNotSupported",
+                       "ter:NoSuchService",
+                       "No such service",
+                       "The requested WSDL service category is not supported by the device");
+            return -2;
+        }
+    } else {
+        icategory = 31;
+    }
+
+    port[0] = '\0';
+    if (service_ctx.port != 80)
+        sprintf(port, ":%d", service_ctx.port);
+    sprintf(device_service_address, "http://%s%s/onvif/device_service", address, port);
+    sprintf(media_service_address, "http://%s%s/onvif/media_service", address, port);
+    sprintf(ptz_service_address, "http://%s%s/onvif/ptz_service", address, port);
+    sprintf(events_service_address, "http://%s%s/onvif/events_service", address, port);
+    sprintf(deviceio_service_address, "http://%s%s/onvif/deviceio_service", address, port);
+    sprintf(imaging_service_address, "http://%s%s/onvif/imaging_service", address, port);
+
+    if (service_ctx.imaging_num > 0) {
+        snprintf(imaging_capabilities_block,
+                 sizeof(imaging_capabilities_block),
+                 "<tt:Imaging><tt:XAddr>%s</tt:XAddr></tt:Imaging>",
+                 imaging_service_address);
+    } else {
+        imaging_capabilities_block[0] = '\0';
+    }
+
+    if ((service_ctx.events_enable == EVENTS_PULLPOINT) || (service_ctx.events_enable == EVENTS_BOTH)) {
+        strcpy(epullpoint, "true");
+    } else {
+        strcpy(epullpoint, "false");
+    }
+    if ((service_ctx.events_enable == EVENTS_BASESUBSCRIPTION) || (service_ctx.events_enable == EVENTS_BOTH)) {
+        strcpy(ebasesubscription, "true");
+    } else {
+        strcpy(ebasesubscription, "false");
+    }
+
+    if ((service_ctx.profiles[0].audio_encoder != AUDIO_NONE)
+        || ((service_ctx.profiles_num == 2) && (service_ctx.profiles[1].audio_encoder != AUDIO_NONE))) {
+        sprintf(audio_sources, "%d", 1);
+    } else {
+        sprintf(audio_sources, "%d", 0);
+    }
+    if (service_ctx.audio.output_enabled) {
+        sprintf(audio_outputs, "%d", 1);
+    } else {
+        sprintf(audio_outputs, "%d", 0);
+    }
+
+    sprintf(relay_outputs, "%d", service_ctx.relay_outputs_num);
+    log_debug("DEBUG: device_get_capabilities - relay_outputs_num: %d, relay_outputs string: %s", service_ctx.relay_outputs_num, relay_outputs);
+
+    if (icategory == 1) {
+        long size = cat(NULL, "device_service_files/GetDeviceCapabilities.xml", 2, "%DEVICE_SERVICE_ADDRESS%", device_service_address);
+
+        output_http_headers(size);
+
+        return cat("stdout", "device_service_files/GetDeviceCapabilities.xml", 2, "%DEVICE_SERVICE_ADDRESS%", device_service_address);
+    } else if (icategory == 2) {
+        long size = cat(NULL, "device_service_files/GetMediaCapabilities.xml", 2, "%MEDIA_SERVICE_ADDRESS%", media_service_address);
+
+        output_http_headers(size);
+
+        return cat("stdout", "device_service_files/GetMediaCapabilities.xml", 2, "%MEDIA_SERVICE_ADDRESS%", media_service_address);
+    } else if (icategory == 4) {
+        if (service_ctx.ptz_node.enable == 1) {
+            long size = cat(NULL, "device_service_files/GetPTZCapabilities.xml", 2, "%PTZ_SERVICE_ADDRESS%", ptz_service_address);
+
+            output_http_headers(size);
+
+            return cat("stdout", "device_service_files/GetPTZCapabilities.xml", 2, "%PTZ_SERVICE_ADDRESS%", ptz_service_address);
+        } else {
+            send_fault("device_service",
+                       "Receiver",
+                       "ter:ActionNotSupported",
+                       "ter:NoSuchService",
+                       "No such service",
+                       "The requested WSDL service category is not supported by the device");
+            return -3;
+        }
+    } else if (icategory == 8) {
+        long size = cat(NULL,
+                        "device_service_files/GetEventsCapabilities.xml",
+                        6,
+                        "%EVENTS_SERVICE_ADDRESS%",
+                        events_service_address,
+                        "%EVENTS_BASESUBSCRIPTION%",
+                        ebasesubscription,
+                        "%EVENTS_PULLPOINT%",
+                        epullpoint);
+
+        output_http_headers(size);
+
+        return cat("stdout",
+                   "device_service_files/GetEventsCapabilities.xml",
+                   6,
+                   "%EVENTS_SERVICE_ADDRESS%",
+                   events_service_address,
+                   "%EVENTS_BASESUBSCRIPTION%",
+                   ebasesubscription,
+                   "%EVENTS_PULLPOINT%",
+                   epullpoint);
+    } else if (icategory == 16) {
+        if (service_ctx.imaging_num > 0) {
+            long size = cat(NULL, "device_service_files/GetImagingCapabilities.xml", 2, "%IMAGING_SERVICE_ADDRESS%", imaging_service_address);
+
+            output_http_headers(size);
+
+            return cat("stdout", "device_service_files/GetImagingCapabilities.xml", 2, "%IMAGING_SERVICE_ADDRESS%", imaging_service_address);
+        } else {
+            send_fault("device_service",
+                       "Receiver",
+                       "ter:ActionNotSupported",
+                       "ter:NoSuchService",
+                       "No such service",
+                       "The requested WSDL service category is not supported by the device");
+            return -4;
+        }
+    } else {
+        if (service_ctx.ptz_node.enable == 0) {
+            long size = cat(NULL,
+                            "device_service_files/GetCapabilities_no_ptz.xml",
+                            20,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%EVENTS_BASESUBSCRIPTION%",
+                            ebasesubscription,
+                            "%EVENTS_PULLPOINT%",
+                            epullpoint,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%AUDIO_SOURCES%",
+                            audio_sources,
+                            "%AUDIO_OUTPUTS%",
+                            audio_outputs,
+                            "%RELAY_OUTPUTS%",
+                            relay_outputs,
+                            "%IMAGING_CAPABILITIES%",
+                            imaging_capabilities_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetCapabilities_no_ptz.xml",
+                       20,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%EVENTS_BASESUBSCRIPTION%",
+                       ebasesubscription,
+                       "%EVENTS_PULLPOINT%",
+                       epullpoint,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%AUDIO_SOURCES%",
+                       audio_sources,
+                       "%AUDIO_OUTPUTS%",
+                       audio_outputs,
+                       "%RELAY_OUTPUTS%",
+                       relay_outputs,
+                       "%IMAGING_CAPABILITIES%",
+                       imaging_capabilities_block);
+        } else {
+            long size = cat(NULL,
+                            "device_service_files/GetCapabilities_ptz.xml",
+                            22,
+                            "%DEVICE_SERVICE_ADDRESS%",
+                            device_service_address,
+                            "%MEDIA_SERVICE_ADDRESS%",
+                            media_service_address,
+                            "%PTZ_SERVICE_ADDRESS%",
+                            ptz_service_address,
+                            "%EVENTS_SERVICE_ADDRESS%",
+                            events_service_address,
+                            "%EVENTS_BASESUBSCRIPTION%",
+                            ebasesubscription,
+                            "%EVENTS_PULLPOINT%",
+                            epullpoint,
+                            "%DEVICEIO_SERVICE_ADDRESS%",
+                            deviceio_service_address,
+                            "%AUDIO_SOURCES%",
+                            audio_sources,
+                            "%AUDIO_OUTPUTS%",
+                            audio_outputs,
+                            "%RELAY_OUTPUTS%",
+                            relay_outputs,
+                            "%IMAGING_CAPABILITIES%",
+                            imaging_capabilities_block);
+
+            output_http_headers(size);
+
+            return cat("stdout",
+                       "device_service_files/GetCapabilities_ptz.xml",
+                       22,
+                       "%DEVICE_SERVICE_ADDRESS%",
+                       device_service_address,
+                       "%MEDIA_SERVICE_ADDRESS%",
+                       media_service_address,
+                       "%PTZ_SERVICE_ADDRESS%",
+                       ptz_service_address,
+                       "%EVENTS_SERVICE_ADDRESS%",
+                       events_service_address,
+                       "%EVENTS_BASESUBSCRIPTION%",
+                       ebasesubscription,
+                       "%EVENTS_PULLPOINT%",
+                       epullpoint,
+                       "%DEVICEIO_SERVICE_ADDRESS%",
+                       deviceio_service_address,
+                       "%AUDIO_SOURCES%",
+                       audio_sources,
+                       "%AUDIO_OUTPUTS%",
+                       audio_outputs,
+                       "%RELAY_OUTPUTS%",
+                       relay_outputs,
+                       "%IMAGING_CAPABILITIES%",
+                       imaging_capabilities_block);
+        }
+    }
+}
+
+int device_get_network_interfaces()
+{
+    char address[16];
+    char netmask[16];
+    char mac_address[18];
+    char mtu[16];
+    int prefix_len;
+    char sprefix_len[3];
+    char ipv6_block[640];
+    char ll_addr[INET6_ADDRSTRLEN] = "";
+    char gl_addr[INET6_ADDRSTRLEN] = "";
+    int ll_prefix = 64, gl_prefix = 64;
+    int ipv6_found;
+    int ret;
+
+    ret = get_ip_address(address, netmask, service_ctx.ifs);
+    if (ret < 0) {
+        log_error("Unable to get ip address from interface %s", service_ctx.ifs);
+        send_action_failed_fault("device_service", -1);
+        return -1;
+    }
+    prefix_len = netmask2prefixlen(netmask);
+    sprintf(sprefix_len, "%d", prefix_len);
+    ret = get_mac_address(mac_address, service_ctx.ifs);
+    if (ret < 0) {
+        mac_address[0] = '\0';
+    }
+    sprintf(mtu, "%d", get_mtu(service_ctx.ifs));
+
+    ipv6_found = get_ip6_address_info(ll_addr, sizeof(ll_addr), &ll_prefix,
+                                      gl_addr, sizeof(gl_addr), &gl_prefix,
+                                      service_ctx.ifs);
+    if (ipv6_found > 0) {
+        char ll_elem[160] = "";
+        char gl_elem[160] = "";
+
+        if (ipv6_found & 1)
+            snprintf(ll_elem, sizeof(ll_elem),
+                     "<tt:LinkLocal><tt:Address>%s</tt:Address><tt:PrefixLength>%d</tt:PrefixLength></tt:LinkLocal>",
+                     ll_addr, ll_prefix);
+        if (ipv6_found & 2)
+            snprintf(gl_elem, sizeof(gl_elem),
+                     "<tt:Manual><tt:Address>%s</tt:Address><tt:PrefixLength>%d</tt:PrefixLength></tt:Manual>",
+                     gl_addr, gl_prefix);
+        snprintf(ipv6_block, sizeof(ipv6_block),
+                 "<tt:IPv6><tt:Enabled>true</tt:Enabled><tt:Config>"
+                 "<tt:AcceptRouterAdvert>false</tt:AcceptRouterAdvert>"
+                 "<tt:DHCP>Off</tt:DHCP>%s%s</tt:Config></tt:IPv6>",
+                 ll_elem, gl_elem);
+    } else {
+        snprintf(ipv6_block, sizeof(ipv6_block),
+                 "<tt:IPv6><tt:Enabled>false</tt:Enabled></tt:IPv6>");
+    }
+
+    long size = cat(NULL,
+                    "device_service_files/GetNetworkInterfaces.xml",
+                    12,
+                    "%INTERFACE%",
+                    service_ctx.ifs,
+                    "%MAC_ADDRESS%",
+                    mac_address,
+                    "%MTU%",
+                    mtu,
+                    "%IP_ADDRESS%",
+                    address,
+                    "%NETMASK%",
+                    sprefix_len,
+                    "%IPV6_BLOCK%",
+                    ipv6_block);
+
+    output_http_headers(size);
+
+    return cat("stdout",
+               "device_service_files/GetNetworkInterfaces.xml",
+               12,
+               "%INTERFACE%",
+               service_ctx.ifs,
+               "%MAC_ADDRESS%",
+               mac_address,
+               "%MTU%",
+               mtu,
+               "%IP_ADDRESS%",
+               address,
+               "%NETMASK%",
+               sprefix_len,
+               "%IPV6_BLOCK%",
+               ipv6_block);
+}
+
+#define DISCOVERY_MODE_FILE "/tmp/onvif_discovery_mode"
+
+static const char *discovery_mode_name(void)
+{
+    FILE *f;
+    char line[64];
+
+    f = fopen(DISCOVERY_MODE_FILE, "r");
+    if (f == NULL)
+        return "Discoverable";
+
+    line[0] = '\0';
+    if (fgets(line, sizeof(line), f) == NULL) {
+        fclose(f);
+        return "Discoverable";
+    }
+    fclose(f);
+
+    if (strncasecmp(line, "NonDiscoverable", 15) == 0)
+        return "NonDiscoverable";
+
+    return "Discoverable";
+}
+
+static int write_discovery_mode(const char *mode)
+{
+    char tmp_path[sizeof(DISCOVERY_MODE_FILE) + 8];
+    int fd;
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", DISCOVERY_MODE_FILE);
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return -1;
+    if (write(fd, mode, strlen(mode)) != (ssize_t) strlen(mode) ||
+        write(fd, "\n", 1) != 1) {
+        close(fd);
+        unlink(tmp_path);
+        return -1;
+    }
+    close(fd);
+
+    if (rename(tmp_path, DISCOVERY_MODE_FILE) < 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void signal_wsd_reload(void)
+{
+    static const char *patterns[] = {
+        "/run/wsd_simple_server*.pid",
+        "/var/run/wsd_simple_server*.pid",
+        "/run/wsd.pid",
+        "/tmp/wsd_simple_server*.pid",
+        "/tmp/wsd.pid",
+        NULL
+    };
+    int i;
+
+    for (i = 0; patterns[i]; i++) {
+        glob_t matches;
+        size_t j;
+
+        memset(&matches, 0, sizeof(matches));
+        if (glob(patterns[i], 0, NULL, &matches) != 0)
+            continue;
+
+        for (j = 0; j < matches.gl_pathc; j++) {
+            FILE *f = fopen(matches.gl_pathv[j], "r");
+            long pid;
+
+            if (f == NULL)
+                continue;
+            if (fscanf(f, "%ld", &pid) == 1 && pid > 0)
+                kill((pid_t) pid, SIGHUP);
+            fclose(f);
+        }
+
+        globfree(&matches);
+    }
+}
+
+int device_get_discovery_mode()
+{
+    const char *mode = discovery_mode_name();
+    long size = cat(NULL, "device_service_files/GetDiscoveryMode.xml", 2, "%DISCOVERY_MODE%", (char *) mode);
+
+    output_http_headers(size);
+
+    return cat("stdout", "device_service_files/GetDiscoveryMode.xml", 2, "%DISCOVERY_MODE%", (char *) mode);
+}
+
+int device_set_discovery_mode()
+{
+    const char *mode = get_element("DiscoveryMode", "Body");
+
+    if (mode == NULL ||
+        (strcasecmp(mode, "Discoverable") != 0 && strcasecmp(mode, "NonDiscoverable") != 0)) {
+        send_fault("device_service",
+                   "Sender",
+                   "ter:InvalidArgVal",
+                   "ter:InvalidDiscoveryMode",
+                   "Invalid discovery mode",
+                   "DiscoveryMode must be Discoverable or NonDiscoverable");
+        return -1;
+    }
+
+    if (write_discovery_mode(mode) < 0) {
+        log_error("Cannot write discovery mode state file: %s", strerror(errno));
+        send_action_failed_fault("device_service", -1);
+        return -1;
+    }
+
+    signal_wsd_reload();
+
+    send_empty_response("tds", "SetDiscoveryMode");
+    return 0;
+}
+
+int device_get_ntp()
+{
+    char ntp_server[256];
+    FILE *fp;
+    char line[512];
+    int found = 0;
+
+    // Try common NTP config file locations on embedded Linux
+    const char *ntp_conf_paths[] = {"/etc/ntp.conf", "/etc/chrony.conf", "/etc/chrony/chrony.conf", NULL};
+    for (int p = 0; ntp_conf_paths[p] != NULL && !found; p++) {
+        fp = fopen(ntp_conf_paths[p], "r");
+        if (fp == NULL)
+            continue;
+        while (fgets(line, sizeof(line), fp) != NULL) {
+            // Match "server <host>" or "pool <host>" directives
+            if (sscanf(line, "server %255s", ntp_server) == 1 ||
+                sscanf(line, "pool %255s", ntp_server) == 1) {
+                // Skip comments and options flags (e.g., "iburst")
+                if (ntp_server[0] != '#' && ntp_server[0] != '\0') {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    if (!found) {
+        // Fallback: check uci/config or use a safe default
+        strncpy(ntp_server, "pool.ntp.org", sizeof(ntp_server) - 1);
+        ntp_server[sizeof(ntp_server) - 1] = '\0';
+    }
+
+    long size = cat(NULL, "device_service_files/GetNTP.xml", 2, "%NTP_SERVER%", ntp_server);
+    output_http_headers(size);
+    return cat("stdout", "device_service_files/GetNTP.xml", 2, "%NTP_SERVER%", ntp_server);
+}
+
+int device_get_network_protocols()
+{
+    char http_port[8];
+    sprintf(http_port, "%d", service_ctx.port);
+
+    long size = cat(NULL, "device_service_files/GetNetworkProtocols.xml", 2, "%HTTP_PORT%", http_port);
+    output_http_headers(size);
+    return cat("stdout", "device_service_files/GetNetworkProtocols.xml", 2, "%HTTP_PORT%", http_port);
+}
+
+int device_set_system_date_and_time()
+{
+    const char *date_type;
+    const char *year_s, *month_s, *day_s;
+    const char *hour_s, *min_s, *sec_s;
+    int year, month, day, hour, min, sec;
+    char cmd[64];
+
+    date_type = get_element("DateTimeType", "Body");
+
+    if (date_type != NULL && strcasecmp(date_type, "NTP") == 0) {
+        // NTP-managed time; accept request but take no action
+        log_info("SetSystemDateAndTime: NTP mode requested, ignoring manual time");
+    } else {
+        // Manual time set - parse UTCDateTime elements
+        year_s  = get_element("Year",   "Body");
+        month_s = get_element("Month",  "Body");
+        day_s   = get_element("Day",    "Body");
+        hour_s  = get_element("Hour",   "Body");
+        min_s   = get_element("Minute", "Body");
+        sec_s   = get_element("Second", "Body");
+
+        if (year_s && month_s && day_s && hour_s && min_s && sec_s) {
+            year  = atoi(year_s);
+            month = atoi(month_s);
+            day   = atoi(day_s);
+            hour  = atoi(hour_s);
+            min   = atoi(min_s);
+            sec   = atoi(sec_s);
+            // Apply the requested time as local wall-clock time.  NVRs in the
+            // field (including the one observed here) send their local time in
+            // the UTCDateTime field rather than UTC, so interpret it as local.
+            // timectl applies the hint and reconciles with NTP, so a client
+            // error (e.g. a DST-off NVR) is corrected rather than persisting.
+            snprintf(cmd, sizeof(cmd), "timectl set-time \"%04d-%02d-%02d %02d:%02d:%02d\" > /dev/null 2>&1",
+                     year, month, day, hour, min, sec);
+            log_info("SetSystemDateAndTime: setting time via: %s", cmd);
+            system(cmd);
+        } else {
+            log_warn("SetSystemDateAndTime: missing date/time elements in request");
+        }
+    }
+
+    long size = cat(NULL, "device_service_files/SetSystemDateAndTime.xml", 0);
+    output_http_headers(size);
+    return cat("stdout", "device_service_files/SetSystemDateAndTime.xml", 0);
+}
+
+int device_create_users()
+{
+    // Devices with static user accounts return MaxUsers fault
+    send_fault("device_service",
+               "Receiver",
+               "ter:Action",
+               "ter:MaxUsers",
+               "Maximum users reached",
+               "The maximum number of users supported by the device has been reached");
+    return -1;
+}
+
+int device_delete_users()
+{
+    const char *username = get_element("Username", "Body");
+    if (username == NULL || username[0] == '\0') {
+        send_fault("device_service", "Sender", "ter:InvalidArgVal", "ter:UsernameMissing",
+                   "Username missing", "No username was provided");
+        return -1;
+    }
+    // On devices with fixed user accounts, we accept the call silently
+    // (pretend success so VMS tools do not loop retrying)
+    send_empty_response("tds", "DeleteUsers");
+    return 0;
+}
+
+int device_set_user()
+{
+    // Accept without error; password changes on embedded devices are
+    // handled outside of ONVIF scope (e.g., via web UI or /etc/passwd)
+    send_empty_response("tds", "SetUser");
+    return 0;
+}
+
+int device_unsupported(const char *method)
+{
+    if (service_ctx.adv_fault_if_unknown == 1)
+        send_action_failed_fault("device_service", -1);
+    else
+        send_empty_response("tds", (char *) method);
+    return -1;
+}

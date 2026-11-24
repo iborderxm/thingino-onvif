@@ -1,0 +1,160 @@
+{
+  "adv_enable_media2": false,
+  "adv_fault_if_set": false,
+  "adv_fault_if_unknown": false,
+  "adv_synology_nvr": false,
+  "audio": {
+    "output_enabled": true
+  },
+  "aux": [
+    {
+      "exec": "light ir on",
+      "name": "IR LED ON"
+    },
+    {
+      "exec": "light ir off",
+      "name": "IR LED OFF"
+    },
+    {
+      "exec": "color on",
+      "name": "COLOR ON"
+    },
+    {
+      "exec": "color off",
+      "name": "COLOR OFF"
+    }
+  ],
+  "events": [
+    {
+      "input_file": "/run/motion/motion_alarm",
+      "sources": [
+        {
+          "name": "Source",
+          "type": "tt:ReferenceToken",
+          "value": "VideoSourceToken"
+        }
+      ],
+      "topic": "tns1:VideoSource/MotionAlarm"
+    },
+    {
+      "input_file": "/run/motion/motion_alarm",
+      "sources": [
+        {
+          "name": "VideoSourceConfigurationToken",
+          "type": "tt:ReferenceToken",
+          "value": "VideoSourceConfigToken"
+        },
+        {
+          "name": "VideoAnalyticsConfigurationToken",
+          "type": "tt:ReferenceToken",
+          "value": "VideoAnalyticsConfigToken"
+        },
+        {
+          "name": "Rule",
+          "type": "xsd:string",
+          "value": "MotionDetector"
+        }
+      ],
+      "topic": "tns1:RuleEngine/CellMotionDetector/Motion"
+    }
+  ],
+  "events_enable": 1,
+  "imaging": [
+    {
+      "cmd_ircut_off": "/sbin/ircut off",
+      "cmd_ircut_on": "/sbin/ircut on",
+      "ircut_modes": [
+        "On",
+        "Off"
+      ],
+      "ircut_state": "On",
+      "video_source_token": "VideoSourceToken"
+    }
+  ],
+  "profiles": {
+    "stream0": {
+      "audio_decoder": "AAC",
+      "audio_encoder": "AAC",
+      "height": 1080,
+      "name": "Profile_0",
+      "snapurl": "http://%s/x/ch0.jpg",
+      "type": "H264",
+      "url": "rtsp://%s/ch0",
+      "width": 1920
+    },
+    "stream1": {
+      "audio_decoder": "AAC",
+      "audio_encoder": "AAC",
+      "height": 360,
+      "name": "Profile_1",
+      "snapurl": "http://%s/x/ch1.jpg",
+      "type": "H264",
+      "url": "rtsp://%s/ch1",
+      "width": 640
+    }
+  },
+  "ptz": {
+    "eflip_mode": "OFF",
+    "eflip_supported": false,
+    "enable": 1,
+    "fov_pan": 90,
+    "fov_tilt": 50,
+    "get_position": "/bin/motors -p",
+    "get_presets": "/sbin/ptz_presets -g",
+    "goto_home_position": "/bin/motors -d b",
+    "is_moving": "/bin/motors -b",
+    "jump_to_abs": "/bin/motors -d h -x %f -y %f",
+    "jump_to_rel": "/bin/motors -d g -x %f -y %f",
+    "max_step_x": 4000,
+    "max_step_y": 2000,
+    "max_step_z": 0,
+    "min_step_x": 0,
+    "min_step_y": 0,
+    "min_step_z": 0,
+    "move_both": "/bin/motors -d h -x %f -y %f",
+    "move_in": "/sbin/ptz_zoom_in",
+    "move_out": "/sbin/ptz_zoom_out",
+    "move_preset": "/sbin/ptz_presets %d > /dev/null",
+    "move_stop": "/bin/motors -d s",
+    "move_x": "/bin/motors -d h -x %f",
+    "move_y": "/bin/motors -d h -y %f",
+    "pan_inverted": false,
+    "pan_max": 180,
+    "pan_min": -180,
+    "remove_preset": "/sbin/ptz_presets -r %d > /dev/null",
+    "reverse_mode": "OFF",
+    "reverse_supported": true,
+    "set_home_position": "/sbin/ptz_set_home",
+    "set_preset": "/sbin/ptz_presets -a %d %s > /dev/null",
+    "tilt_inverted": false,
+    "tilt_max": 90,
+    "tilt_min": -90,
+    "zoom": false
+  },
+  "relays": [
+    {
+      "close": "ircut off",
+      "idle_state": "close",
+      "open": "ircut on",
+      "token": "IRCutFilter"
+    },
+    {
+      "close": "light ir off",
+      "idle_state": "close",
+      "open": "light ir on",
+      "token": "IRLEDs"
+    }
+  ],
+  "scopes": [
+    "onvif://www.onvif.org/Profile/Streaming",
+    "onvif://www.onvif.org/hardware",
+    "onvif://www.onvif.org/name"
+  ],
+  "server": {
+    "ifs": "wlan0",
+    "log_directory": "",
+    "log_level": "INFO",
+    "log_on_error_only": false,
+    "port": 80
+  }
+}

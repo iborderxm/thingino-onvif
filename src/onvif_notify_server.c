@@ -1,0 +1,1068 @@
+/*
+ * Copyright (c) 2024 roleo.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, version 3.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include "conf.h"
+#include "log.h"
+#include "onvif_simple_server.h"
+#include "utils.h"
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <libgen.h>
+#include <limits.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/inotify.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+
+#define DEFAULT_PID_FILE "/var/run/onvif_notify_server.pid"
+#define TEMPLATE_DIR "/var/www/onvif/notify_files"
+#define INOTIFY_DIR "/run/motion"
+
+#define ALARM_OFF 0
+#define ALARM_ON 1
+
+#define PID_SIZE 32
+
+// Timeout for connect/send towards push notification subscribers
+#define NOTIFY_TIMEOUT_MS 5000
+
+static int parse_reference_url(const char *reference, char *host, size_t host_len, char *page, size_t page_len, int *port_out)
+{
+    const char *scheme_end;
+    const char *authority;
+    const char *path_start;
+    const char *host_end;
+    const char *port_sep = NULL;
+    size_t host_size;
+    long port_tmp = 0;
+
+    if (reference == NULL || host == NULL || page == NULL || port_out == NULL)
+        return -1;
+
+    scheme_end = strstr(reference, "://");
+    if (scheme_end == NULL)
+        return -1;
+
+    authority = scheme_end + 3; // skip "://"
+    if (*authority == '\0')
+        return -1;
+
+    path_start = strchr(authority, '/');
+    if (path_start == NULL) {
+        host_end = reference + strlen(reference);
+    } else {
+        host_end = path_start;
+    }
+
+    port_sep = memchr(authority, ':', (size_t) (host_end - authority));
+    if (port_sep != NULL) {
+        host_size = (size_t) (port_sep - authority);
+    } else {
+        host_size = (size_t) (host_end - authority);
+    }
+
+    if (host_size == 0 || host_size >= host_len)
+        return -1;
+
+    memcpy(host, authority, host_size);
+    host[host_size] = '\0';
+
+    if (port_sep != NULL) {
+        const char *port_str = port_sep + 1;
+        size_t port_len = (size_t) (host_end - port_sep - 1);
+        char port_buf[8];
+
+        if (port_len == 0 || port_len >= sizeof(port_buf))
+            return -1;
+        memcpy(port_buf, port_str, port_len);
+        port_buf[port_len] = '\0';
+        port_tmp = strtol(port_buf, NULL, 10);
+        if (port_tmp <= 0 || port_tmp > 65535)
+            return -1;
+    }
+
+    *port_out = (int) (port_tmp > 0 ? port_tmp : (*port_out));
+
+    if (path_start == NULL) {
+        if (page_len < 2)
+            return -1;
+        page[0] = '/';
+        page[1] = '\0';
+    } else {
+        size_t remaining = strlen(path_start);
+        if (remaining >= page_len)
+            return -1;
+        memcpy(page, path_start, remaining + 1);
+    }
+
+    return 0;
+}
+
+shm_t *subs_evts;
+service_context_t service_ctx;
+
+// Global variables
+char *conf_file;
+int debug;
+int exit_main;
+sem_t *sem_shmem;
+subscription_shm_t saved_subscriptions[MAX_SUBSCRIPTIONS];
+static time_t last_emit_time[MAX_EVENTS]; // per-event debounce timestamp (seconds)
+
+int check_pid(char *file_name)
+{
+    FILE *f;
+    long pid;
+    char pid_buffer[PID_SIZE];
+
+    f = fopen(file_name, "r");
+    if (f == NULL)
+        return 0;
+
+    if (fgets(pid_buffer, PID_SIZE, f) == NULL) {
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+
+    if (sscanf(pid_buffer, "%ld", &pid) != 1) {
+        return 0;
+    }
+
+    if (kill(pid, 0) == 0) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/*
+ * Atomically acquire the pid file.
+ *
+ * A separate check-then-create pid file sequence is a TOCTOU race: two
+ * instances started at the same time can both pass the check and both come
+ * up, fighting over the shared memory and sending duplicate notifies.
+ * O_CREAT|O_EXCL leaves only one winner. If the file already exists, check
+ * whether its owner is still alive: if yes, bail out; if not, take over the
+ * stale file.
+ *
+ * Returns 0 if acquired, 1 if another instance is running, -1 on error.
+ */
+int acquire_pid_file(char *file_name)
+{
+    int fd = -1;
+    int attempt, len;
+    char pid_buffer[PID_SIZE];
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        fd = open(file_name, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0)
+            break;
+        if (errno != EEXIST)
+            return -1;
+
+        // Pid file exists: is its owner still alive?
+        if (check_pid(file_name) == 1)
+            return 1;
+
+        // Stale file from a crashed instance: take it over
+        log_warn("Removing stale pid file %s", file_name);
+        if (unlink(file_name) < 0 && errno != ENOENT)
+            return -1;
+    }
+    if (fd < 0)
+        return -1;
+
+    len = snprintf(pid_buffer, sizeof(pid_buffer), "%ld\n", (long) getpid());
+    if (len < 0 || len >= (int) sizeof(pid_buffer) || write(fd, pid_buffer, len) != len) {
+        close(fd);
+        unlink(file_name);
+        return -1;
+    }
+    close(fd);
+
+    return 0;
+}
+
+/*
+ * Remove the pid file only if it still contains our own pid.
+ *
+ * During a restart a slowly-exiting old instance used to unlink the fresh
+ * pid file already written by its replacement, leaving the new daemon
+ * unguarded — the next restart then piled up duplicate instances.
+ */
+void release_pid_file(char *file_name)
+{
+    FILE *f;
+    long pid = -1;
+
+    f = fopen(file_name, "r");
+    if (f == NULL)
+        return;
+    if (fscanf(f, "%ld", &pid) != 1)
+        pid = -1;
+    fclose(f);
+
+    if (pid == (long) getpid())
+        unlink(file_name);
+}
+
+void print_subscriptions()
+{
+    int i;
+    char iso_str[21];
+
+    fprintf(stderr, "Subscriptions\n");
+    for (i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+        to_iso_date(iso_str, sizeof(iso_str), subs_evts->subscriptions[i].expire);
+        fprintf(stderr, "\tSubscription %d\n", i);
+        if (subs_evts->subscriptions[i].used) {
+            fprintf(stderr, "\t\tid:               %d\n", subs_evts->subscriptions[i].id);
+            fprintf(stderr, "\t\treference:        %s\n", subs_evts->subscriptions[i].reference);
+            fprintf(stderr, "\t\tused:             %d\n", subs_evts->subscriptions[i].used);
+            fprintf(stderr, "\t\texpire:           %s\n", iso_str);
+            fprintf(stderr, "\t\ttopic_expression: %s\n", subs_evts->subscriptions[i].topic_expression);
+            fprintf(stderr, "\t\tpush_need_sync:   %d\n", subs_evts->subscriptions[i].push_need_sync);
+        } else {
+            fprintf(stderr, "\t\tid:             0\n");
+            fprintf(stderr, "\t\treference:\n");
+            fprintf(stderr, "\t\tused:           0\n");
+            fprintf(stderr, "\t\texpire:\n");
+            fprintf(stderr, "\t\ttopic_expression:\n");
+            fprintf(stderr, "\t\tpush_need_sync: 0\n");
+        }
+    }
+
+    fprintf(stderr, "Events\n");
+    for (i = 0; i < service_ctx.events_num; i++) {
+        to_iso_date(iso_str, sizeof(iso_str), subs_evts->events[i].e_time);
+        fprintf(stderr, "\tEvent          %d\n", i);
+        fprintf(stderr, "\t\ttopic:       %s\n", service_ctx.events[i].topic);
+        fprintf(stderr, "\t\te_time:      %s\n", iso_str);
+        fprintf(stderr, "\t\tis_on:       %d\n", subs_evts->events[i].is_on);
+        fprintf(stderr, "\t\tpull_notify: %08x\n", subs_evts->events[i].pull_notify);
+    }
+}
+
+void signal_handler(int signal)
+{
+    if (signal == SIGUSR1) {
+        print_subscriptions();
+    } else {
+        // Exit from main loop
+        exit_main = 1;
+    }
+}
+
+/*
+ * Connect with a timeout.
+ *
+ * A plain blocking connect() to an unreachable push subscriber stalls the
+ * notify loop (and daemon shutdown) for the kernel's full SYN retry cycle —
+ * up to ~2 minutes. Use a non-blocking connect + poll instead, then restore
+ * blocking mode for the caller.
+ */
+int connect_with_timeout(int sockfd, struct sockaddr *addr, socklen_t addrlen, int timeout_ms)
+{
+    int flags, res, so_error;
+    socklen_t so_len;
+    struct pollfd pfd;
+
+    flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0)
+        return -1;
+
+    res = connect(sockfd, addr, addrlen);
+    if (res < 0) {
+        if (errno != EINPROGRESS)
+            return -1;
+
+        pfd.fd = sockfd;
+        pfd.events = POLLOUT;
+        do {
+            res = poll(&pfd, 1, timeout_ms);
+        } while (res < 0 && errno == EINTR && !exit_main);
+        if (res <= 0)
+            return -1; // timeout, error or shutdown requested
+
+        so_error = 0;
+        so_len = sizeof(so_error);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &so_len) < 0 || so_error != 0)
+            return -1;
+    }
+
+    if (fcntl(sockfd, F_SETFL, flags) < 0)
+        return -1;
+
+    return 0;
+}
+
+int send_notify(char *reference, int alarm_index, time_t e_time, char *property, char *value)
+{
+    char host[1024];
+    int port = 80;
+    char page[1024];
+    char header_fmt[] = "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/soap+xml\r\nContent-Length: %s\r\nConnection: close\r\n\r\n";
+    char *header;
+    char *message;
+    int size;
+    char size_string[32];
+    char template_file[1024];
+    int sockfd;
+    struct sockaddr_in remote;
+    char utctime[32];
+
+    // Prepare time string
+    to_iso_date(utctime, sizeof(utctime), e_time);
+
+    // Prepare IP address
+    if (strncmp("https", reference, 5) == 0)
+        port = 443;
+    if (parse_reference_url(reference, host, sizeof(host), page, sizeof(page), &port) != 0) {
+        log_error("Invalid reference URL: %s", reference);
+        return -5;
+    }
+
+    // Configure socket
+    memset(&remote, '\0', sizeof(remote));
+    remote.sin_addr.s_addr = inet_addr(host);
+    remote.sin_family = AF_INET;
+    remote.sin_port = htons(port);
+
+    log_debug("Sending notify message to %s - host %s - port %d - page %s", reference, host, port, page);
+    log_debug("topic %s - UTC time %s - value %s", service_ctx.events[alarm_index].topic, utctime, value);
+
+    /* create the socket */
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        log_error("Error opening socket");
+        return -1;
+    }
+
+    if (connect_with_timeout(sockfd, (struct sockaddr *) &remote, sizeof(remote), NOTIFY_TIMEOUT_MS) != 0) {
+        log_error("Connection to %s:%d failed or timed out", host, port);
+        close(sockfd);
+        return -2;
+    }
+
+    // Bound the send as well, so a stalled subscriber cannot block the loop
+    struct timeval send_timeout;
+    send_timeout.tv_sec = NOTIFY_TIMEOUT_MS / 1000;
+    send_timeout.tv_usec = (NOTIFY_TIMEOUT_MS % 1000) * 1000;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
+
+    // Get size of message content
+    log_info("Sending Notify message.");
+    sprintf(template_file, "%s/Notify.xml", TEMPLATE_DIR);
+    char sources_xml[512];
+    build_event_sources(sources_xml, sizeof(sources_xml), &service_ctx.events[alarm_index]);
+    char data_name[32];
+    const char *topic = service_ctx.events[alarm_index].topic ? service_ctx.events[alarm_index].topic : "";
+    if (strstr(topic, "tns1:Device/Trigger/Relay")) {
+        strcpy(data_name, "LogicalState");
+    } else if (strstr(topic, "CellMotionDetector/Motion")) {
+        strcpy(data_name, "IsMotion");
+    } else {
+        strcpy(data_name, "State");
+    }
+    size = cat(NULL,
+               template_file,
+               12,
+               "%TOPIC%",
+               topic,
+               "%UTC_TIME%",
+               utctime,
+               "%PROPERTY%",
+               property,
+               "%SOURCES%",
+               sources_xml,
+               "%DATA_NAME%",
+               data_name,
+               "%DATA_VALUE%",
+               value);
+    int size_len = snprintf(size_string, sizeof(size_string), "%d", size);
+    if (size_len < 0 || size_len >= (int) sizeof(size_string)) {
+        log_error("Notify payload size too large");
+        close(sockfd);
+        return -3;
+    }
+
+    int header_calc = snprintf(NULL, 0, header_fmt, page, host, size_string);
+    if (header_calc < 0) {
+        log_error("Failed to compute header size");
+        close(sockfd);
+        return -3;
+    }
+    size_t header_length = (size_t) header_calc + 1;
+    header = (char *) malloc(header_length);
+    if (header == NULL) {
+        log_error("Malloc error.\n");
+        close(sockfd);
+        return -3;
+    }
+    if (snprintf(header, header_length, header_fmt, page, host, size_string) >= (int) header_length) {
+        log_error("Header formatting error");
+        free(header);
+        close(sockfd);
+        return -3;
+    }
+
+    message = (char *) malloc((size + strlen(header) + 1) * sizeof(char));
+    if (message == NULL) {
+        log_error("Malloc error.\n");
+        free(header);
+        close(sockfd);
+        return -3;
+    }
+
+    strcpy(message, header);
+    cat(&message[strlen(header)],
+        template_file,
+        12,
+        "%TOPIC%",
+        topic,
+        "%UTC_TIME%",
+        utctime,
+        "%PROPERTY%",
+        property,
+        "%SOURCES%",
+        sources_xml,
+        "%DATA_NAME%",
+        data_name,
+        "%DATA_VALUE%",
+        value);
+
+    if (sendto(sockfd, message, strlen(message), 0, (struct sockaddr *) &remote, sizeof(remote)) < 0) {
+        log_error("Error sending Notify message.\n");
+        free(header);
+        free(message);
+        close(sockfd);
+        return -4;
+    }
+
+    free(header);
+    free(message);
+    log_info("Sent.");
+
+    // Close socket properly
+    shutdown(sockfd, SHUT_RDWR);
+    close(sockfd);
+
+    return 0;
+}
+
+void sync_events(int sub_index)
+{
+    int i;
+    char value[8];
+    time_t now;
+
+    log_info("Synchronization requested");
+
+    for (i = 0; i < service_ctx.events_num; i++) {
+        if (is_topic_in_expression(subs_evts->subscriptions[sub_index].topic_expression, service_ctx.events[i].topic)) {
+            if (access(service_ctx.events[i].input_file, F_OK) == 0)
+                strcpy(value, "true");
+            else
+                strcpy(value, "false");
+
+            // Semaphore is already ok
+            if (subs_evts->subscriptions[sub_index].used == SUB_PUSH) {
+                // Check if subscription is expired
+                now = time(NULL);
+                if (now > subs_evts->subscriptions[sub_index].expire)
+                    continue;
+
+                send_notify(subs_evts->subscriptions[sub_index].reference, i, now, "Initialized", value);
+            }
+            log_debug("Event %d matches topic expression %s", i, subs_evts->subscriptions[sub_index].topic_expression);
+        }
+    }
+
+    log_info("Synchronization done");
+}
+
+void clean_expired_subscriptions()
+{
+    int i;
+    time_t now;
+
+    // Semaphore is already ok
+    for (i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+        if (subs_evts->subscriptions[i].expire != 0) {
+            // Check if subscription is expired
+            now = time(NULL);
+            if (now > subs_evts->subscriptions[i].expire) {
+                // Log details before clearing
+                char expire_str[21];
+                to_iso_date(expire_str, sizeof(expire_str), subs_evts->subscriptions[i].expire);
+                log_info("Cleaning expired subscription: slot=%d, id=%d, type=%s, expired_at=%s",
+                         i,
+                         subs_evts->subscriptions[i].id,
+                         subs_evts->subscriptions[i].used == SUB_PULL ? "PULL" : "PUSH",
+                         expire_str);
+                memset(&subs_evts->subscriptions[i], '\0', sizeof(subscription_shm_t));
+            }
+        }
+    }
+}
+
+void check_subscriptions_status()
+{
+    int i;
+    char iso_str[21];
+
+    // Semaphore is already ok
+    for (i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+        if ((saved_subscriptions[i].used == SUB_UNUSED) && (subs_evts->subscriptions[i].used != saved_subscriptions[i].used)) {
+            to_iso_date(iso_str, sizeof(iso_str), subs_evts->subscriptions[i].expire);
+            log_info("Subscription %d created:", i);
+            log_info("\tid:               %d", subs_evts->subscriptions[i].id);
+            log_info("\treference:        %s", subs_evts->subscriptions[i].reference);
+            log_info("\tused:             %d", subs_evts->subscriptions[i].used);
+            log_info("\texpire:           %s", iso_str);
+            log_info("\ttopic_expression: %s", subs_evts->subscriptions[i].topic_expression);
+            log_info("\tpush_need_sync:   %d", subs_evts->subscriptions[i].push_need_sync);
+        }
+        if ((saved_subscriptions[i].used != SUB_UNUSED) && (subs_evts->subscriptions[i].used != saved_subscriptions[i].used)) {
+            log_info("Subscription %d destroyed", i);
+        }
+    }
+    memcpy(saved_subscriptions, subs_evts->subscriptions, sizeof(subscription_shm_t) * MAX_SUBSCRIPTIONS);
+}
+
+void *sync_events_thread(void *arg)
+{
+    int i;
+
+    while (!exit_main) {
+        // Sync all events
+        for (i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+            sem_memory_wait();
+            if (subs_evts->subscriptions[i].push_need_sync == 1) {
+                subs_evts->subscriptions[i].push_need_sync = 0;
+                sync_events(i);
+            }
+            sem_memory_post();
+        }
+        // Clean expired_subscriptions
+        sem_memory_wait();
+        clean_expired_subscriptions();
+        check_subscriptions_status();
+        sem_memory_post();
+        usleep(500 * 1000);
+    }
+}
+
+int handle_inotify_events(int fd, char *dir)
+{
+    /* Some systems cannot read integer variables if they are not
+       properly aligned. On other systems, incorrect alignment may
+       decrease performance. Hence, the buffer used for reading from
+       the inotify file descriptor should have the same alignment as
+       struct inotify_event. */
+
+    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+    const struct inotify_event *event;
+    ssize_t len;
+    int i, j;
+    int sub_count;
+    char input_file[1024], value[8];
+    time_t now;
+    char *ptr;
+
+    /* Loop while events can be read from inotify file descriptor. */
+    for (;;) {
+        /* Read some events. */
+
+        len = read(fd, buf, sizeof(buf));
+        if (len == -1 && errno != EAGAIN) {
+            log_error("Error reading from inotify file descriptor");
+            return -1;
+        }
+
+        /* If the nonblocking read() found no events to read, then
+           it returns -1 with errno set to EAGAIN. In that case,
+           we exit the loop. */
+        if (len <= 0)
+            break;
+
+        /* Loop over all events in the buffer. */
+        for (ptr = buf; ptr < buf + len; ptr += sizeof(struct inotify_event) + event->len) {
+            event = (const struct inotify_event *) ptr;
+
+            /* Print event type. */
+            if (((event->mask & (IN_CREATE | IN_DELETE | IN_MODIFY)) != 0) && ((event->mask & IN_ISDIR) == 0) && (event->len)) {
+                if (snprintf(input_file, sizeof(input_file), "%s/%s", dir, event->name) >= (int) sizeof(input_file)) {
+                    log_error("Input path too long for %s/%s", dir, event->name);
+                    continue;
+                }
+                if (event->mask & IN_CREATE) {
+                    strcpy(value, "true");
+                    log_debug("File %s created", input_file);
+                } else if (event->mask & IN_DELETE) {
+                    strcpy(value, "false");
+                    log_debug("File %s deleted", input_file);
+                } else if (event->mask & IN_MODIFY) {
+                    /* Treat modify as a presence/changed signal (e.g. truncate/touch) */
+                    if (access(input_file, F_OK) == 0) {
+                        strcpy(value, "true");
+                        log_debug("File %s modified (exists)", input_file);
+                    } else {
+                        strcpy(value, "false");
+                        log_debug("File %s modified (not found)", input_file);
+                    }
+                }
+
+                for (i = 0; i < service_ctx.events_num; i++) {
+                    if (strcmp(service_ctx.events[i].input_file, input_file) == 0) {
+                        now = time(NULL);
+                        sub_count = 0;
+                        sem_memory_wait();
+                        subs_evts->events[i].e_time = now;
+                        if (event->mask & IN_CREATE) {
+                            subs_evts->events[i].is_on = 1;
+                        } else if (event->mask & IN_DELETE) {
+                            subs_evts->events[i].is_on = 0;
+                        }
+
+                        int allow = 1;
+                        if (service_ctx.events_min_interval_ms > 0) {
+                            long diff_ms = (long) (now - last_emit_time[i]) * 1000L;
+                            if (diff_ms < service_ctx.events_min_interval_ms) {
+                                allow = 0; // Suppress notification due to debounce
+                            } else {
+                                last_emit_time[i] = now;
+                            }
+                        }
+
+                        if (allow) {
+                            for (j = 0; j < MAX_SUBSCRIPTIONS; j++) {
+                                if (subs_evts->subscriptions[j].used == SUB_PULL) {
+                                    // Check if subscription is expired
+                                    if (now > subs_evts->subscriptions[j].expire)
+                                        continue;
+                                    if (is_topic_in_expression(subs_evts->subscriptions[j].topic_expression, service_ctx.events[i].topic)) {
+                                        sub_count++;
+                                        subs_evts->events[i].pull_notify |= (1 << j);
+                                        log_debug("Event %d matches topic expression %s", i, subs_evts->subscriptions[j].topic_expression);
+                                    }
+                                } else if (subs_evts->subscriptions[j].used == SUB_PUSH) {
+                                    // Check if subscription is expired
+                                    if (now > subs_evts->subscriptions[j].expire)
+                                        continue;
+                                    sub_count++;
+                                    send_notify(subs_evts->subscriptions[j].reference, i, subs_evts->events[i].e_time, "Changed", value);
+                                }
+                            }
+                        } else {
+                            log_debug("Debounced event %d (min_interval_ms=%d)", i, service_ctx.events_min_interval_ms);
+                        }
+                        sem_memory_post();
+                        log_debug("%d notification subscriptions for %s file", sub_count, service_ctx.events[i].input_file);
+                    }
+                }
+            }
+        }
+    }
+}
+
+void print_usage(char *progname)
+{
+    fprintf(stderr, "\nUsage: %s [-c JSON_CONF_FILE] [-p PID_FILE] [-d LEVEL]\n\n", progname);
+    fprintf(stderr, "\t-c JSON_CONF_FILE, --conf_file JSON_CONF_FILE\n");
+    fprintf(stderr, "\t\tpath of the JSON configuration file (default %s)\n", DEFAULT_JSON_CONF_FILE);
+    fprintf(stderr, "\t-p PID_FILE, --pid_file PID_FILE\n");
+    fprintf(stderr, "\t\tpid file\n");
+
+    fprintf(stderr, "\t-d LEVEL, --debug LEVEL\n");
+    fprintf(stderr, "\t\tlog level: FATAL, ERROR, WARN, INFO, DEBUG, TRACE or 0-5 (default FATAL)\n");
+    fprintf(stderr, "\t-h, --help\n");
+    fprintf(stderr, "\t\tprint this help\n");
+}
+
+int main(int argc, char **argv)
+{
+    int errno;
+    char *endptr;
+    int c, i, j, ret, itmp;
+    char pid_file[1024];
+    int debug_cli_set = 0;
+
+    int fd = -1;
+    int wd, poll_num;
+    nfds_t nfds;
+    struct pollfd fds[1];
+
+    int acc;
+
+    time_t now;
+    int sub_count;
+
+    conf_file = (char *) malloc((strlen(DEFAULT_JSON_CONF_FILE) + 1) * sizeof(char));
+    strcpy(conf_file, DEFAULT_JSON_CONF_FILE);
+
+    strcpy(pid_file, DEFAULT_PID_FILE);
+    debug = 0;
+
+    while (1) {
+        static struct option long_options[] = {{"conf_file", required_argument, 0, 'c'},
+                                               {"pid_file", required_argument, 0, 'p'},
+                                               {"debug", required_argument, 0, 'd'},
+                                               {"help", no_argument, 0, 'h'},
+                                               {0, 0, 0, 0}};
+        /* getopt_long stores the option index here. */
+        int option_index = 0;
+
+        c = getopt_long(argc, argv, "c:p:d:h", long_options, &option_index);
+
+        /* Detect the end of the options. */
+        if (c == -1)
+            break;
+
+        switch (c) {
+        case 'c':
+            /* Check for various possible errors */
+            if (strlen(optarg) < MAX_LEN - 1) {
+                free(conf_file);
+                conf_file = (char *) malloc((strlen(optarg) + 1) * sizeof(char));
+                strcpy(conf_file, optarg);
+            } else {
+                print_usage(argv[0]);
+                exit(EXIT_FAILURE);
+            }
+            break;
+
+        case 'p':
+            if (strlen(optarg) < 1024)
+                strcpy(pid_file, optarg);
+            break;
+
+        case 'd':
+            debug = log_level_from_string(optarg);
+            if (debug < 0) {
+                fprintf(stderr, "Invalid log level: %s\n", optarg);
+                fprintf(stderr, "Valid levels: FATAL, ERROR, WARN, INFO, DEBUG, TRACE or 0-5\n");
+                print_usage(argv[0]);
+                exit(EXIT_FAILURE);
+            }
+            /* level set directly: textual or numeric */
+            debug_cli_set = 1;
+            break;
+
+        case 'h':
+            print_usage(argv[0]);
+            exit(EXIT_SUCCESS);
+            break;
+
+        case '?':
+            /* getopt_long already printed an error message. */
+            break;
+
+        default:
+            print_usage(argv[0]);
+            exit(EXIT_SUCCESS);
+        }
+    }
+
+    // Set signal handler
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+    signal(SIGUSR1, signal_handler);
+
+    if (conf_file[0] == '\0') {
+        print_usage(argv[0]);
+        free(conf_file);
+        exit(EXIT_SUCCESS);
+    }
+    if (strlen(conf_file) <= 5) {
+        print_usage(argv[0]);
+        free(conf_file);
+        exit(EXIT_SUCCESS);
+    }
+
+    // Open file log
+    log_init("onvif_notify_server", LOG_DAEMON, debug, 1);
+    log_info("Starting program.");
+    log_debug("pid_file = %s", pid_file);
+
+    // Acquire pid file (atomic, with stale file takeover)
+    ret = acquire_pid_file(pid_file);
+    if (ret == 1) {
+        log_fatal("Program is already running.\n");
+        exit(EXIT_FAILURE);
+    } else if (ret != 0) {
+        log_fatal("Error creating pid file %s\n", pid_file);
+        exit(EXIT_FAILURE);
+    }
+
+    // Read configuration file
+    log_info("Processing configuration file %s...", conf_file);
+    itmp = process_json_conf_file(conf_file);
+    if (itmp == -1) {
+        log_fatal("Unable to find configuration file %s", conf_file);
+        free(conf_file);
+        exit(EXIT_FAILURE);
+    } else if (itmp < -1) {
+        log_fatal("Wrong syntax in configuration file %s", conf_file);
+        free(conf_file);
+        exit(EXIT_FAILURE);
+    }
+    log_info("Completed.");
+
+    // Apply log level from config if CLI -d was not provided
+    if (!debug_cli_set) {
+        if (service_ctx.loglevel >= LOG_LVL_FATAL && service_ctx.loglevel <= LOG_LVL_TRACE) {
+            log_set_level(service_ctx.loglevel);
+            debug = service_ctx.loglevel;
+        }
+    }
+
+    // Check if TEMPLATE_DIR exists
+    if (access(TEMPLATE_DIR, F_OK) != -1) {
+        // file exists
+        DIR *dirptr;
+        if ((dirptr = opendir(TEMPLATE_DIR)) != NULL) {
+            closedir(dirptr);
+        } else {
+            log_fatal("Unable to open directory %s", TEMPLATE_DIR);
+            free(conf_file);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        log_fatal("Unable to open directory %s", TEMPLATE_DIR);
+        free(conf_file);
+        exit(EXIT_FAILURE);
+    }
+
+    // Check if INOTIFY_DIR exists
+    if (access(INOTIFY_DIR, F_OK) != -1) {
+        // file exists
+        DIR *dirptr;
+        if ((dirptr = opendir(INOTIFY_DIR)) != NULL) {
+            closedir(dirptr);
+        } else {
+            log_fatal("Unable to open directory %s", INOTIFY_DIR);
+            free(conf_file);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        log_fatal("Unable to open directory %s", INOTIFY_DIR);
+        free(conf_file);
+        exit(EXIT_FAILURE);
+    }
+
+    // Open shared memory
+    subs_evts = (shm_t *) create_shared_memory(1);
+    if (subs_evts == NULL) {
+        log_fatal("Unable to create shared memory.");
+        release_pid_file(pid_file);
+        exit(EXIT_FAILURE);
+    }
+    sem_memory_wait();
+    memset(subs_evts, '\0', sizeof(shm_t));
+    sem_memory_post();
+
+    // Log events
+    for (i = 0; i < service_ctx.events_num; i++) {
+        log_debug("%d: %s", i, service_ctx.events[i].input_file);
+    }
+
+    // Create the file descriptor for accessing the inotify API
+    fd = inotify_init1(IN_NONBLOCK);
+    if (fd == -1) {
+        if (errno == ENOSYS) {
+            log_error("inotify interface not implemented, try poll strategy");
+        } else {
+            log_fatal("Unable to init inotify interface");
+            destroy_shared_memory(subs_evts, 1);
+            release_pid_file(pid_file);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    if (fd != -1) {
+        // Mark directory for events
+        // - file was created
+        // - file was deleted
+        wd = inotify_add_watch(fd, INOTIFY_DIR, IN_CREATE | IN_DELETE | IN_MODIFY);
+        if (wd == -1) {
+            log_fatal("Cannot watch '%s': %s\n", INOTIFY_DIR, strerror(errno));
+            close(fd);
+            destroy_shared_memory(subs_evts, 1);
+            release_pid_file(pid_file);
+            exit(EXIT_FAILURE);
+        }
+
+        // Prepare for polling
+        nfds = 1;
+        fds[0].fd = fd; // Inotify input
+        fds[0].events = POLLIN;
+    }
+
+    // Create thread to monitor subscriptions->push_need_sync
+    pthread_t sync_events_pthread;
+    pthread_create(&sync_events_pthread, NULL, sync_events_thread, NULL);
+    pthread_detach(sync_events_pthread);
+
+    // Wait for events
+    log_info("Listening for events.");
+    while (!exit_main) {
+        // Check if new events are fired
+        if (fd != -1) {
+            poll_num = poll(fds, nfds, -1);
+            if (poll_num == -1) {
+                if (errno == EINTR)
+                    continue;
+                log_error("Error in poll");
+                sleep(1);
+            }
+
+            if (poll_num > 0) {
+                if (fds[0].revents & POLLIN) {
+                    // Inotify events are available
+                    handle_inotify_events(fd, INOTIFY_DIR);
+                }
+            }
+        } else { // Inotify interface is not available
+            for (i = 0; i < service_ctx.events_num; i++) {
+                acc = access(service_ctx.events[i].input_file, F_OK);
+
+                if ((subs_evts->events[i].is_on != ALARM_ON) && (acc == 0)) {
+                    now = time(NULL);
+                    sub_count = 0;
+                    log_info("File %s created", service_ctx.events[i].input_file);
+
+                    sem_memory_wait();
+                    subs_evts->events[i].e_time = now;
+                    subs_evts->events[i].is_on = ALARM_ON;
+
+                    int allow = 1;
+                    if (service_ctx.events_min_interval_ms > 0) {
+                        long diff_ms = (long) (now - last_emit_time[i]) * 1000L;
+                        if (diff_ms < service_ctx.events_min_interval_ms) {
+                            allow = 0;
+                        } else {
+                            last_emit_time[i] = now;
+                        }
+                    }
+
+                    if (allow) {
+                        for (j = 0; j < MAX_SUBSCRIPTIONS; j++) {
+                            if (subs_evts->subscriptions[j].used == SUB_PULL) {
+                                // Check if subscription is expired
+                                if (now > subs_evts->subscriptions[j].expire)
+                                    continue;
+                                if (is_topic_in_expression(subs_evts->subscriptions[j].topic_expression, service_ctx.events[i].topic)) {
+                                    sub_count++;
+                                    subs_evts->events[i].pull_notify |= (1 << j);
+                                    log_debug("Event %d matches topic expression %s", i, subs_evts->subscriptions[j].topic_expression);
+                                }
+                            } else if (subs_evts->subscriptions[j].used == SUB_PUSH) {
+                                // Check if subscription is expired
+                                if (now > subs_evts->subscriptions[j].expire)
+                                    continue;
+                                sub_count++;
+                                send_notify(subs_evts->subscriptions[j].reference, i, subs_evts->events[i].e_time, "Changed", "true");
+                            }
+                        }
+                    } else {
+                        log_debug("Debounced event %d (min_interval_ms=%d)", i, service_ctx.events_min_interval_ms);
+                    }
+                    sem_memory_post();
+                    log_debug("%d notification subscriptions for %s file", sub_count, service_ctx.events[i].input_file);
+
+                } else if ((subs_evts->events[i].is_on != ALARM_OFF) && (acc != 0)) {
+                    now = time(NULL);
+                    sub_count = 0;
+                    log_info("File %s deleted", service_ctx.events[i].input_file);
+
+                    sem_memory_wait();
+                    subs_evts->events[i].e_time = now;
+                    subs_evts->events[i].is_on = ALARM_OFF;
+
+                    int allow = 1;
+                    if (service_ctx.events_min_interval_ms > 0) {
+                        long diff_ms = (long) (now - last_emit_time[i]) * 1000L;
+                        if (diff_ms < service_ctx.events_min_interval_ms) {
+                            allow = 0;
+                        } else {
+                            last_emit_time[i] = now;
+                        }
+                    }
+
+                    if (allow) {
+                        for (j = 0; j < MAX_SUBSCRIPTIONS; j++) {
+                            if (subs_evts->subscriptions[j].used == SUB_PULL) {
+                                // Check if subscription is expired
+                                if (now > subs_evts->subscriptions[j].expire)
+                                    continue;
+                                if (is_topic_in_expression(subs_evts->subscriptions[j].topic_expression, service_ctx.events[i].topic)) {
+                                    sub_count++;
+                                    subs_evts->events[i].pull_notify |= (1 << j);
+                                    log_debug("Event %d matches topic expression %s", i, subs_evts->subscriptions[j].topic_expression);
+                                }
+                            } else if (subs_evts->subscriptions[j].used == SUB_PUSH) {
+                                // Check if subscription is expired
+                                if (now > subs_evts->subscriptions[j].expire)
+                                    continue;
+                                sub_count++;
+                                send_notify(subs_evts->subscriptions[j].reference, i, subs_evts->events[i].e_time, "Changed", "false");
+                            }
+                        }
+                    } else {
+                        log_debug("Debounced event %d (min_interval_ms=%d)", i, service_ctx.events_min_interval_ms);
+                    }
+                    sem_memory_post();
+                    log_debug("%d notification subscriptions for %s file", sub_count, service_ctx.events[i].input_file);
+                }
+            }
+
+            usleep(100000);
+        }
+    }
+
+    log_info("Listening for events stopped.");
+
+    // Close inotify file descriptor
+    if (fd != -1)
+        close(fd);
+
+    destroy_shared_memory(subs_evts, 1);
+
+    release_pid_file(pid_file);
+    log_info("Terminating program.");
+
+    // free_conf_file(); // Let the system handle cleanup
+    free(conf_file);
+
+    return 0;
+}
