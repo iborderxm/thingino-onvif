@@ -110,6 +110,13 @@ LIBS_W		+= $(MXML_LIBS)
 INCLUDE		+= -I$(SRC_DIR) -I.
 INCLUDE		+= $(MXML_CFLAGS)
 
+# Detect the installed json_config.h (jct) numeric layout by probing whether
+# the newer JsonNumberValue members (value.number.real) are available:
+#  - older jct: JsonValue.value.number is a plain scalar
+#  - jct >= 1.2: JsonValue.value.number is JsonNumberValue (integer/real)
+JSON_NUMBER_IS_STRUCT	:= $(shell $(CC) $(INCLUDE) -fsyntax-only $(SRC_DIR)/json_compat_probe.c >/dev/null 2>&1 && echo 1 || echo 0)
+JSON_COMPAT		:= -DJSON_NUMBER_IS_STRUCT=$(JSON_NUMBER_IS_STRUCT)
+
 ifeq ($(STRIP), )
     STRIP=echo
 endif
@@ -122,10 +129,10 @@ debug: LDFLAGS_DEBUG = -fsanitize=address -fsanitize=undefined
 debug: clean onvif_simple_server_debug onvif_notify_server_debug wsd_simple_server_debug
 
 $(SRC_DIR)/log.o: $(SRC_DIR)/log.c $(HEADERS)
-	$(CC) -c $< -std=c99 -fPIC -Os $(INCLUDE) -o $@
+	$(CC) -c $< -std=c99 -fPIC -Os $(INCLUDE) $(JSON_COMPAT) -o $@
 
-$(SRC_DIR)/%.o: $(SRC_DIR)/%.c $(HEADERS)
-	$(CC) -c $< -fPIC -Os $(INCLUDE) -o $@
+$(SRC_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/json_compat.h $(HEADERS)
+	$(CC) -c $< -fPIC -Os $(INCLUDE) $(JSON_COMPAT) -o $@
 
 
 # JCT library compilation (for development)
@@ -146,11 +153,11 @@ wsd_simple_server: $(OBJECTS_W)
 	$(STRIP) $@
 
 # Debug build rules
-$(SRC_DIR)/%.debug.o: $(SRC_DIR)/%.c $(HEADERS)
-	$(CC) -c $< $(CFLAGS_DEBUG) $(INCLUDE) -o $@
+$(SRC_DIR)/%.debug.o: $(SRC_DIR)/%.c $(SRC_DIR)/json_compat.h $(HEADERS)
+	$(CC) -c $< $(CFLAGS_DEBUG) $(INCLUDE) $(JSON_COMPAT) -o $@
 
 $(SRC_DIR)/log.debug.o: $(SRC_DIR)/log.c $(HEADERS)
-	$(CC) -c $< -std=c99 $(CFLAGS_DEBUG) $(INCLUDE) -o $@
+	$(CC) -c $< -std=c99 $(CFLAGS_DEBUG) $(INCLUDE) $(JSON_COMPAT) -o $@
 
 OBJECTS_O_DEBUG = $(OBJECTS_O:.o=.debug.o)
 OBJECTS_N_DEBUG = $(OBJECTS_N:.o=.debug.o)

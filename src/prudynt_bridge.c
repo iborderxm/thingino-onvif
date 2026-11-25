@@ -1,5 +1,6 @@
 #include "prudynt_bridge.h"
 
+#include "json_compat.h"
 #include "log.h"
 
 #include <errno.h>
@@ -40,12 +41,12 @@ static void parse_field(JsonValue *fields, const char *name, prudynt_field_state
     if (value->type != JSON_NUMBER || min->type != JSON_NUMBER || max->type != JSON_NUMBER)
         return;
 
-    double raw_min = min->value.number.real;
-    double raw_max = max->value.number.real;
+    double raw_min = JSON_NUMBER_DOUBLE(min);
+    double raw_max = JSON_NUMBER_DOUBLE(max);
     if (raw_max <= raw_min)
         return;
 
-    double raw_value = value->value.number.real;
+    double raw_value = JSON_NUMBER_DOUBLE(value);
 
     out->present = 1;
     out->value = (float) raw_value;
