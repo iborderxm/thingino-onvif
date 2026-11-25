@@ -793,10 +793,13 @@ static void build_scopes_from_config(JsonValue *root)
     scopes[0] = '\0';
     for (i = 0; i < count; i++) {
         JsonValue *item = get_array_item(array, i);
-        const char *value = json_object_get_string(item);
+        const char *value;
         int n;
 
-        if (value == NULL || value[0] == '\0')
+        if (item == NULL || item->type != JSON_STRING || item->value.string == NULL)
+            continue;
+        value = item->value.string;
+        if (value[0] == '\0')
             continue;
         n = snprintf(scopes + used, sizeof(scopes) - used, "%s%s", used ? " " : "", value);
         if (n < 0 || (size_t) n >= sizeof(scopes) - used)
