@@ -519,9 +519,9 @@ int events_pull_messages()
                     // ONVIF event catalog: CellMotionDetector/Motion carries IsMotion
                     strcpy(data_name, "IsMotion");
                 } else if (service_ctx.events[i].topic != NULL
-                           && strstr(service_ctx.events[i].topic, "PersonDetector/Person")) {
-                    // RuleEngine/PersonDetector/Person carries IsPersonDetected
-                    strcpy(data_name, "IsPersonDetected");
+                           && strstr(service_ctx.events[i].topic, "MyRuleDetector/PeopleDetect")) {
+                    // RuleEngine/MyRuleDetector/PeopleDetect carries IsPeopleDetected
+                    strcpy(data_name, "IsPeopleDetected");
                 } else {
                     strcpy(data_name, "State");
                 }
@@ -1027,7 +1027,7 @@ static void topic_level_close(char *out, size_t outlen, const char *comp)
         snprintf(out, outlen, "</tns1:%s>", comp);
 }
 
-/* Data item carried by a known event topic (State/IsMotion/IsPersonDetected/...) */
+/* Data item carried by a known event topic (State/IsMotion/IsPeopleDetected/...) */
 static void event_data_item(const char *topic, char *data_name, char *data_type)
 {
     if ((topic != NULL) && (strcmp(topic, "tns1:Device/Trigger/Relay") == 0)) {
@@ -1041,9 +1041,9 @@ static void event_data_item(const char *topic, char *data_name, char *data_type)
         // ONVIF event catalog: CellMotionDetector/Motion advertises IsMotion
         strcpy(data_name, "IsMotion");
         strcpy(data_type, "xsd:boolean");
-    } else if ((topic != NULL) && (strstr(topic, "PersonDetector/Person") != NULL)) {
-        // RuleEngine/PersonDetector/Person advertises IsPersonDetected
-        strcpy(data_name, "IsPersonDetected");
+    } else if ((topic != NULL) && (strstr(topic, "MyRuleDetector/PeopleDetect") != NULL)) {
+        // RuleEngine/MyRuleDetector/PeopleDetect advertises IsPeopleDetected
+        strcpy(data_name, "IsPeopleDetected");
         strcpy(data_type, "xsd:boolean");
     } else {
         strcpy(data_name, "State");

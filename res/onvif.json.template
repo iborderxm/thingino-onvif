@@ -48,7 +48,7 @@
             "input_file": "/run/motion/motion_alarm"
         },
         {
-            "topic": "tns1:RuleEngine/PersonDetector/Person",
+            "topic": "tns1:RuleEngine/MyRuleDetector/PeopleDetect",
             "sources": [
                 {
                     "name": "VideoSourceConfigurationToken",
@@ -63,7 +63,7 @@
                 {
                     "name": "Rule",
                     "type": "xsd:string",
-                    "value": "PersonDetector"
+                    "value": "PeopleDetector"
                 }
             ],
             "input_file": "/run/motion/person_alarm"
